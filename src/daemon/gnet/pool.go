@@ -5,45 +5,56 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"log"
 	"net"
 	"reflect"
+	"sync"
 	"time"
 
+	"io"
+
 	"github.com/skycoin/skycoin/src/cipher/encoder"
-	"gopkg.in/op/go-logging.v1"
+	"github.com/skycoin/skycoin/src/daemon/strand"
+
+	"github.com/skycoin/skycoin/src/util/elapse"
+	"github.com/skycoin/skycoin/src/util/logging"
+	"github.com/skycoin/skycoin/src/util/utc"
 )
-
-var DebugPrint bool = true //disable to disable printing
-
-// TODO -- parameterize configuration per pool
 
 // DisconnectReason is passed to ConnectionPool's DisconnectCallback
 type DisconnectReason error
 
-var (
-	// DisconnectReadFailed also includes a remote closed socket
-	DisconnectReadFailed DisconnectReason = errors.New(
-		"Read failed")
-	DisconnectWriteFailed DisconnectReason = errors.New(
-		"Write failed")
-	DisconnectSetReadDeadlineFailed = errors.New(
-		"SetReadDeadline failed")
-	DisconnectInvalidMessageLength DisconnectReason = errors.New(
-		"Invalid message length")
-	DisconnectMalformedMessage DisconnectReason = errors.New(
-		"Malformed message body")
-	DisconnectUnknownMessage DisconnectReason = errors.New(
-		"Unknown message ID")
-	DisconnectWriteQueueFull DisconnectReason = errors.New(
-		"Write queue full")
-	DisconnectUnexpectedError DisconnectReason = errors.New(
-		"Unexpected error encountered")
+const (
+	receiveMessageDurationThreshold = 500 * time.Millisecond
+	readLoopDurationThreshold       = 10 * time.Second
+	sendInMsgChanDurationThreshold  = 5 * time.Second
+	sendLoopDurationThreshold       = 500 * time.Millisecond
+	sendResultTimeout               = 3 * time.Second
+)
 
+var (
+	// ErrDisconnectReadFailed also includes a remote closed socket
+	ErrDisconnectReadFailed DisconnectReason = errors.New("Read failed")
+	// ErrDisconnectWriteFailed write faile
+	ErrDisconnectWriteFailed DisconnectReason = errors.New("Write failed")
+	// ErrDisconnectSetReadDeadlineFailed set read deadline failed
+	ErrDisconnectSetReadDeadlineFailed = errors.New("SetReadDeadline failed")
+	// ErrDisconnectInvalidMessageLength invalid message length
+	ErrDisconnectInvalidMessageLength DisconnectReason = errors.New("Invalid message length")
+	// ErrDisconnectMalformedMessage malformed message
+	ErrDisconnectMalformedMessage DisconnectReason = errors.New("Malformed message body")
+	// ErrDisconnectUnknownMessage unknow message
+	ErrDisconnectUnknownMessage DisconnectReason = errors.New("Unknown message ID")
+	// ErrDisconnectWriteQueueFull write queue is full
+	ErrDisconnectWriteQueueFull DisconnectReason = errors.New("Write queue full")
+	// ErrDisconnectUnexpectedError  unexpected error
+	ErrDisconnectUnexpectedError DisconnectReason = errors.New("Unexpected error encountered")
+	// ErrConnectionPoolClosed error message indicates the connection pool is closed
+	ErrConnectionPoolClosed = errors.New("Connection pool is closed")
 	// Logger
 	logger = logging.MustGetLogger("gnet")
 )
 
+// Config gnet config
 type Config struct {
 	// Address to listen on. Leave empty for arbitrary assignment
 	Address string
@@ -62,8 +73,6 @@ type Config struct {
 	// Timeout for writing to a connection. Set to 0 to default to the
 	// system's timeout
 	WriteTimeout time.Duration
-	// Event channel buffering
-	EventChannelSize int
 	// Broadcast result buffers
 	BroadcastResultSize int
 	// Individual connections' send queue size.  This should be increased
@@ -73,23 +82,26 @@ type Config struct {
 	DisconnectCallback DisconnectCallback
 	// Triggered on client connect
 	ConnectCallback ConnectCallback
+	// Print debug logs
+	DebugPrint bool
 }
 
-// Returns a Config with defaults set
+// NewConfig returns a Config with defaults set
 func NewConfig() Config {
 	return Config{
-		Address:                  "",
-		Port:                     0,
-		MaxConnections:           128,
-		MaxMessageLength:         256 * 1024,
-		DialTimeout:              time.Minute,
-		ReadTimeout:              time.Minute,
-		WriteTimeout:             time.Minute,
-		EventChannelSize:         4096,
+		Address:          "",
+		Port:             0,
+		MaxConnections:   128,
+		MaxMessageLength: 256 * 1024,
+		DialTimeout:      time.Minute,
+		ReadTimeout:      time.Minute,
+		WriteTimeout:     time.Minute,
+		// EventChannelSize:         4096,
 		BroadcastResultSize:      16,
 		ConnectionWriteQueueSize: 32,
 		DisconnectCallback:       nil,
 		ConnectCallback:          nil,
+		DebugPrint:               false,
 	}
 }
 
@@ -101,7 +113,7 @@ const (
 // Connection is stored by the ConnectionPool
 type Connection struct {
 	// Key in ConnectionPool.Pool
-	Id int
+	ID int
 	// TCP connection
 	Conn net.Conn
 	// Message buffer
@@ -114,514 +126,652 @@ type Connection struct {
 	LastSent time.Time
 	// Message send queue.
 	WriteQueue chan Message
-	// Synchronizers for read/write loop termination
-	writeLoopDone chan bool
-	readLoopDone  chan bool
+	Solicited  bool
 }
 
-// Creates a new Connection tied to a ConnectionPool
-func NewConnection(pool *ConnectionPool, id int, conn net.Conn,
-	writeQueueSize int) *Connection {
-	c := &Connection{
-		Id:             id,
+// NewConnection creates a new Connection tied to a ConnectionPool
+func NewConnection(pool *ConnectionPool, id int, conn net.Conn, writeQueueSize int, solicited bool) *Connection {
+	return &Connection{
+		ID:             id,
 		Conn:           conn,
 		Buffer:         &bytes.Buffer{},
 		ConnectionPool: pool,
 		LastReceived:   Now(),
 		LastSent:       Now(),
 		WriteQueue:     make(chan Message, writeQueueSize),
-		writeLoopDone:  make(chan bool, 1),
-		readLoopDone:   make(chan bool, 1),
+		Solicited:      solicited,
 	}
-	c.writeLoopDone <- false
-	c.readLoopDone <- false
-	return c
 }
 
-func (self *Connection) Addr() string {
-	return self.Conn.RemoteAddr().String()
+// Addr returns remote address
+func (conn *Connection) Addr() string {
+	return conn.Conn.RemoteAddr().String()
 }
 
-func (self *Connection) String() string {
-	return self.Addr()
+// String returns connection address
+func (conn *Connection) String() string {
+	return conn.Addr()
 }
 
-func (self *Connection) Close() {
-	self.Conn.Close()
-	if self.WriteQueue != nil {
-		close(self.WriteQueue)
-	}
-	<-self.writeLoopDone
-	<-self.readLoopDone
-
-	self.Buffer.Reset()
-	self.WriteQueue = nil
+// Close close the connection and write queue
+func (conn *Connection) Close() {
+	conn.Conn.Close()
+	close(conn.WriteQueue)
+	conn.WriteQueue = nil
+	conn.Buffer = &bytes.Buffer{}
 }
 
-// Channel event for incoming socket data
-type dataEvent struct {
-	ConnId int    // Id for the Connection that produced this event
-	Data   []byte // Data sent by the Connection
-}
+// DisconnectCallback triggered on client disconnect
+type DisconnectCallback func(addr string, reason DisconnectReason)
 
-// Event generated when user disconnects
-type DisconnectEvent struct {
-	ConnId int
-	Reason DisconnectReason
-}
+// ConnectCallback triggered on client connect
+type ConnectCallback func(addr string, solicited bool)
 
-// Triggered on client disconnect
-type DisconnectCallback func(c *Connection, reason DisconnectReason)
-
-// Triggered on client connect
-type ConnectCallback func(c *Connection, solicited bool)
-
+// ConnectionPool connection pool
 type ConnectionPool struct {
 	// Configuration parameters
 	Config Config
-	// All connections, indexed by ConnId
-	Pool map[int]*Connection
-	// All connections, indexed by address
-	Addresses map[string]*Connection
-	// Channel for buffered disconnects
-	DisconnectQueue chan DisconnectEvent
 	// Channel for async message sending
 	SendResults chan SendResult
+	// All connections, indexed by ConnId
+	pool map[int]*Connection
+	// All connections, indexed by address
+	addresses map[string]*Connection
 	// User-defined state to be passed into message handlers
 	messageState interface{}
 	// Connection ID counter
-	connId int
-	// Channel for this pool
-	eventChannel chan dataEvent
+	connID int
 	// Listening connection
 	listener net.Listener
-	// connectionQueue, for eliminating contention of the Pool/Addresses
-	connectionQueue chan *Connection
-	// channel for synchronizing teardown
-	acceptLock chan bool
+	// operations channel
+	reqC chan strand.Request
+	// quit channel
+	quit chan struct{}
+	wg   sync.WaitGroup
 }
 
-// Creates a new ConnectionPool that will listen on Config.Port upon
-// StartListen.  State is an application defined object that will be
-// passed to a Message's Handle().
+// NewConnectionPool creates a new ConnectionPool that will listen on
+// Config.Port upon StartListen. State is an application defined object that
+// will be passed to a Message's Handle().
 func NewConnectionPool(c Config, state interface{}) *ConnectionPool {
 	pool := &ConnectionPool{
-		Config:          c,
-		Pool:            make(map[int]*Connection),
-		Addresses:       make(map[string]*Connection),
-		DisconnectQueue: make(chan DisconnectEvent, c.MaxConnections),
-		SendResults:     make(chan SendResult, c.BroadcastResultSize),
-		eventChannel:    make(chan dataEvent, c.EventChannelSize),
-		messageState:    state,
-		// connectionQueue must not be buffered to guarantee the Pool is
-		// updated before processing is done
-		connectionQueue: make(chan *Connection),
-		acceptLock:      make(chan bool, 1),
+		Config:       c,
+		pool:         make(map[int]*Connection),
+		addresses:    make(map[string]*Connection),
+		SendResults:  make(chan SendResult, c.BroadcastResultSize),
+		messageState: state,
+		quit:         make(chan struct{}),
+		reqC:         make(chan strand.Request),
 	}
-	pool.acceptLock <- false
+
 	return pool
 }
 
-// Creates a new Connection around a net.Conn.  Trying to make a connection
-// to an address that is already connected will panic.
-func (self *ConnectionPool) NewConnection(conn net.Conn) *Connection {
-	a := conn.RemoteAddr().String()
-	if self.Addresses[a] != nil {
-		log.Panicf("Already connected to %s", a)
-	}
-	self.connId++
-	c := NewConnection(self, self.connId, conn,
-		self.Config.ConnectionWriteQueueSize)
-	self.connectionQueue <- c
-	return c
-}
+// Run starts the connection pool
+func (pool *ConnectionPool) Run() error {
+	defer logger.Info("Connection pool closed")
 
-// Accepts incoming connections and sends them off for processing.
-// This function blocks, you will want to run it in a goroutine.
-func (self *ConnectionPool) AcceptConnections() {
-	logger.Debug("Accepting connections...")
-	if self.listener == nil {
-		log.Panic("Not listening, call StartListen first")
-	}
-	defer func() {
-		// If Accept fails for a reason other than StopListen closing listener,
-		// this could block indefinitely
-		self.acceptLock <- true
-	}()
-	// Grab the lock
-	<-self.acceptLock
-	// If we raced with StopListen and it beat us, listener will be nil and
-	// the intent was for us to stop.
-	if self.listener == nil {
-		return
-	}
-	for {
-		// this blocks until connection or error
-		conn, err := self.listener.Accept()
-		if err != nil {
-			logger.Debug("No longer accepting connections")
-			break
-		}
-		self.handleConnection(conn, false)
-	}
-}
+	// start the connection accept loop
+	addr := fmt.Sprintf("%s:%v", pool.Config.Address, pool.Config.Port)
+	logger.Info("Listening for connections on %s...", addr)
 
-// Begin listening on the port the ConnectionPool is configured for.
-// Calling StartListen() twice with no intermediate StopListen() will panic.
-func (self *ConnectionPool) StartListen() error {
-	if self.listener != nil {
-		log.Panic("Already listening, call StopListen first")
-	}
-	addr := fmt.Sprintf("%s:%v", self.Config.Address, self.Config.Port)
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
 	}
-	logger.Debug("Listening on %s", addr)
-	self.listener = ln
+
+	pool.listener = ln
+
+	pool.wg.Add(1)
+	go func() {
+		defer pool.wg.Done()
+		for {
+			select {
+			case <-pool.quit:
+				return
+			case req := <-pool.reqC:
+				if err := req.Func(); err != nil {
+					logger.Error("req.Func %s failed: %v", req.Name, err)
+				}
+			}
+		}
+	}()
+
+loop:
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			// When Accept() returns with a non-nil error, we check the quit
+			// channel to see if we should continue or quit
+			select {
+			case <-pool.quit:
+				break loop
+			default:
+				// without the default case the select will block.
+				logger.Error("%v", err)
+				continue
+			}
+		}
+
+		pool.wg.Add(1)
+		go func() {
+			defer pool.wg.Done()
+			pool.handleConnection(conn, false)
+		}()
+	}
+	pool.wg.Wait()
 	return nil
 }
 
-// Stop accepting connections, close all connections, empty the Pool and
-// reset all event channels
-func (self *ConnectionPool) StopListen() {
-	logger.Debug("Closing %d connections", len(self.Pool))
-	if self.listener != nil {
-		self.listener.Close()
+// Shutdown gracefully shutdown the connection pool
+func (pool *ConnectionPool) Shutdown() {
+	close(pool.quit)
+
+	if pool.listener != nil {
+		pool.listener.Close()
 	}
-	// Synchronize with AcceptConnections:
-	// Grab the acceptLock. Either:
-	//  -Waits for AcceptConnections to stop due to listener being closed
-	//  -AcceptConnections is not running at all
-	//  -AcceptConnections is running but has not tried to grab its lock yet
-	<-self.acceptLock
-	// Set listener to nil now, in case we raced with AcceptConnections
-	// and beat it to the lock.  We assume that in a race, StopListen
-	// takes priority, since you shouldn't be calling StopListen in a
-	// goroutine but you always call AcceptConnections in one.
-	self.listener = nil
-	// Unlock for future AcceptConnections
-	self.acceptLock <- false
-	for i, c := range self.Pool {
-		c.Conn.Close()
-		delete(self.Pool, i)
-		delete(self.Addresses, c.Addr())
+
+	pool.listener = nil
+}
+
+// strand ensures all read and write action of pool's member variable are in one thread.
+func (pool *ConnectionPool) strand(name string, f func() error) error {
+	name = fmt.Sprintf("daemon.gnet.ConnectionPool.%s", name)
+	return strand.WithQuit(logger, pool.reqC, name, f, pool.quit, ErrConnectionPoolClosed)
+}
+
+// NewConnection creates a new Connection around a net.Conn.  Trying to make a connection
+// to an address that is already connected will failed.
+func (pool *ConnectionPool) NewConnection(conn net.Conn, solicited bool) (*Connection, error) {
+	a := conn.RemoteAddr().String()
+	var nc *Connection
+	if err := pool.strand("NewConnection", func() error {
+		if pool.addresses[a] != nil {
+			return fmt.Errorf("Already connected to %s", a)
+		}
+		pool.connID++
+		nc = NewConnection(pool, pool.connID, conn, pool.Config.ConnectionWriteQueueSize, solicited)
+
+		pool.pool[nc.ID] = nc
+		pool.addresses[a] = nc
+		return nil
+	}); err != nil {
+		return nil, err
 	}
-	// Channels must be closed after connections are closed, so that their
-	// RW goroutines can terminate.  Otherwise they might try to send on a
-	// closed queue.
-	close(self.eventChannel)
-	close(self.DisconnectQueue)
-	close(self.connectionQueue)
-	self.connectionQueue = make(chan *Connection)
-	self.eventChannel = make(chan dataEvent, self.Config.EventChannelSize)
-	self.DisconnectQueue = make(chan DisconnectEvent,
-		self.Config.MaxConnections)
+
+	return nc, nil
+}
+
+// ListeningAddress returns address, on which the ConnectionPool
+// listening on. It returns nil, and error if the ConnectionPool
+// is not listening
+func (pool *ConnectionPool) ListeningAddress() (net.Addr, error) {
+	if pool.listener == nil {
+		return nil, errors.New("Not listening, call StartListen first")
+	}
+	return pool.listener.Addr(), nil
 }
 
 // Creates a Connection and begins its read and write loop
-func (self *ConnectionPool) handleConnection(conn net.Conn,
-	solicited bool) *Connection {
-	a := conn.RemoteAddr().String()
-	c := self.Addresses[a]
-	if c != nil {
-		log.Panicf("Connection %s already exists", a)
-	}
-	c = self.NewConnection(conn)
-	if self.Config.ConnectCallback != nil {
-		self.Config.ConnectCallback(c, solicited)
-	}
-	go self.connectionReadLoop(c)
-	go self.ConnectionWriteLoop(c)
-	return c
-}
-
-// Connect to an address
-func (self *ConnectionPool) Connect(address string) (*Connection, error) {
-	if c := self.Addresses[address]; c != nil {
-		return c, nil
-	}
-	logger.Debug("Making TCP Connection to %s", address)
-	conn, err := net.DialTimeout("tcp", address, self.Config.DialTimeout)
+func (pool *ConnectionPool) handleConnection(conn net.Conn, solicited bool) {
+	defer logger.Debug("connection %s closed", conn.RemoteAddr())
+	addr := conn.RemoteAddr().String()
+	exist, err := pool.IsConnExist(addr)
 	if err != nil {
-		return nil, err
-	}
-	return self.handleConnection(conn, true), nil
-}
-
-// Removes a Connection from the pool, and passes a DisconnectReason to the
-// DisconnectCallback
-func (self *ConnectionPool) Disconnect(c *Connection, r DisconnectReason) {
-	if c == nil {
+		logger.Error("%v", err)
 		return
 	}
-	_, exists := self.Pool[c.Id]
-	if !exists {
+
+	if exist {
+		logger.Error("Connection %s already exists", addr)
 		return
 	}
-	self.DisconnectQueue <- DisconnectEvent{
-		ConnId: c.Id,
-		Reason: r,
-	}
-}
 
-// Removes address found in a DisconnectEvent.  This needs to be called when
-// your application pulls a DisconnectEvent off of the DisconnectQueue
-func (self *ConnectionPool) HandleDisconnectEvent(e DisconnectEvent) {
-	c := self.Pool[e.ConnId]
-	if c == nil {
+	c, err := pool.NewConnection(conn, solicited)
+	if err != nil {
+		logger.Error("Create connection failed: %v", err)
 		return
 	}
-	c.Close()
-	delete(self.Pool, c.Id)
-	delete(self.Addresses, c.Addr())
-	if self.Config.DisconnectCallback != nil {
-		self.Config.DisconnectCallback(c, e.Reason)
-	}
-}
 
-// Returns the pool as an array of *Connections
-func (self *ConnectionPool) GetConnections() []*Connection {
-	conns := make([]*Connection, len(self.Pool))
-	i := 0
-	for _, c := range self.Pool {
-		conns[i] = c
-		i++
+	if pool.Config.ConnectCallback != nil {
+		pool.Config.ConnectCallback(c.Addr(), solicited)
 	}
-	return conns
-}
 
-// Returns the underlying net.Conn in the Pool
-func (self *ConnectionPool) GetRawConnections() []net.Conn {
-	conns := make([]net.Conn, len(self.Pool))
-	i := 0
-	for _, c := range self.Pool {
-		conns[i] = c.Conn
-		i++
-	}
-	return conns
-}
+	msgC := make(chan []byte, 10)
+	errC := make(chan error, 3)
 
-// Writes message to a client socket in a goroutine.
-// This is only public because its very helpful for testing applications
-// that use this module.  Don't call it from non-test code.
-func (self *ConnectionPool) ConnectionWriteLoop(c *Connection) {
-	<-c.writeLoopDone
-	for {
-		m, ok := <-c.WriteQueue
-		if !ok {
-			break
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+	qc := make(chan struct{})
+	go func() {
+		defer wg.Done()
+		if err := pool.readLoop(c, msgC, qc); err != nil {
+			errC <- err
 		}
-		err := sendMessage(c.Conn, m, self.Config.WriteTimeout)
-		sr := newSendResult(c, m, err)
-		self.SendResults <- sr
-		if err != nil {
-			self.Disconnect(c, DisconnectWriteFailed)
-			break
-		}
-		c.LastSent = Now()
-	}
-	c.writeLoopDone <- true
-}
-
-// Reads data from socket into channel in a goroutine for each connection
-func (self *ConnectionPool) connectionReadLoop(conn *Connection) {
-	<-conn.readLoopDone
-	reason := DisconnectUnexpectedError
-	defer func() {
-		self.Disconnect(conn, reason)
 	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := pool.sendLoop(c, pool.Config.WriteTimeout, qc); err != nil {
+			errC <- err
+		}
+	}()
+
+	wg.Add(1)
+	go func() {
+		var elapser = elapse.NewElapser(receiveMessageDurationThreshold, logger)
+		defer wg.Done()
+		defer elapser.CheckForDone()
+		for {
+			select {
+			case msg, ok := <-msgC:
+				if !ok {
+					return
+				}
+				elapser.Register("pool.receiveMessage")
+				if err := pool.receiveMessage(c, msg); err != nil {
+					errC <- err
+					return
+				}
+				elapser.CheckForDone()
+			}
+		}
+	}()
+
+	select {
+	case <-pool.quit:
+		if err := conn.Close(); err != nil {
+			logger.Error("conn.Close() error: %v", err)
+		}
+	case err = <-errC:
+		if err := pool.Disconnect(c.Addr(), err); err != nil {
+			logger.Error("Disconnect failed: %v", err)
+		}
+	}
+	close(qc)
+
+	wg.Wait()
+}
+
+func (pool *ConnectionPool) readLoop(conn *Connection, msgChan chan []byte, qc chan struct{}) error {
+	defer close(msgChan)
+	// read data from connection
 	reader := bufio.NewReader(conn.Conn)
 	buf := make([]byte, 1024)
+	var elapser = elapse.NewElapser(readLoopDurationThreshold, logger)
+	var sendInMsgChanElapser = elapse.NewElapser(sendInMsgChanDurationThreshold, logger)
+	defer elapser.CheckForDone()
+	defer sendInMsgChanElapser.CheckForDone()
 	for {
+		elapser.Register("readLoop")
 		deadline := time.Time{}
-		if self.Config.ReadTimeout != 0 {
-			deadline = time.Now().Add(self.Config.ReadTimeout)
+		if pool.Config.ReadTimeout != 0 {
+			deadline = time.Now().Add(pool.Config.ReadTimeout)
 		}
 		if err := conn.Conn.SetReadDeadline(deadline); err != nil {
-			logger.Error("Failed to set read deadline for %s", conn.Addr())
-			reason = DisconnectSetReadDeadlineFailed
-			break
+			return ErrDisconnectSetReadDeadlineFailed
 		}
-		c, err := reader.Read(buf)
+		data, err := readData(reader, buf)
 		if err != nil {
-			logger.Debug("Failed to read from %s: %v", conn.Addr(), err)
-			reason = DisconnectReadFailed
-			break
+			return err
 		}
-		if c == 0 {
+
+		if data == nil {
 			continue
 		}
-		//logger.Debug("Read %d bytes from %s", c, conn.Addr())
 
-		data := make([]byte, c)
-		n := copy(data, buf)
-		if n != c {
-			// I don't believe this can ever occur
-			log.Panic("Failed to copy all the bytes")
+		// write data to buffer
+		if _, err := conn.Buffer.Write(data); err != nil {
+			return err
 		}
-		// Write data to channel for processing
-		self.eventChannel <- dataEvent{ConnId: conn.Id, Data: data}
-	}
-	conn.readLoopDone <- true
-}
-
-// Processes a new queued connection
-func (self *ConnectionPool) handleConnectionQueue() *Connection {
-	select {
-	case c := <-self.connectionQueue:
-		logger.Debug("New connection to %s pulled off connectionQueue",
-			c.Addr())
-		self.Pool[c.Id] = c
-		self.Addresses[c.Addr()] = c
-		return c
-	default:
-		return nil
-	}
-}
-
-// Pulls all available event data from eventChannel and copies it to each
-// client's buffer
-// TODO -- this might not need to be separate, the client can maybe
-// write to their buffer directly?
-func (self *ConnectionPool) processEvents() {
-	for len(self.eventChannel) > 0 {
-		event := <-self.eventChannel
-		c, worked := self.Pool[event.ConnId]
-		if !worked {
-			// The client must have been disconnected before we got to its
-			// message here
-			logger.Debug("No connection found for the event")
-			continue
+		// decode data
+		datas, err := decodeData(conn.Buffer, pool.Config.MaxMessageLength)
+		if err != nil {
+			return err
 		}
-		//logger.Debug("Got an event from %s", c.Addr())
-
-		// There is no need to check this call's return values
-		// "The return value n is the length of p; err is always nil.
-		// If the buffer becomes too large, Write will panic with ErrTooLarge."
-		n, _ := c.Buffer.Write(event.Data)
-		_ = n
-		//logger.Debug("Wrote %d bytes to the client buffer", n)
+		for _, d := range datas {
+			sendInMsgChanElapser.Register("readLoop msgChan write")
+			// use select to avoid the goroutine leak,
+			// because if msgChan has no receiver this goroutine will leak
+			select {
+			case <-qc:
+				return nil
+			case <-pool.quit:
+				return nil
+			case msgChan <- d:
+			default:
+				return errors.New("The msgChan has no receiver")
+			}
+		}
+		sendInMsgChanElapser.CheckForDone()
 	}
 }
 
-// Converts a client's connection buffer to byte messages
-func (self *ConnectionPool) processConnectionBuffer(c *Connection) {
-	for c.Buffer.Len() > messageLengthSize {
+func (pool *ConnectionPool) sendLoop(conn *Connection, timeout time.Duration, qc chan struct{}) error {
+	var elapser = elapse.NewElapser(sendLoopDurationThreshold, logger)
+	defer elapser.CheckForDone()
+	for {
+		elapser.CheckForDone()
+		select {
+		case <-pool.quit:
+			return nil
+		case <-qc:
+			return nil
+		case m := <-conn.WriteQueue:
+			elapser.Register("conn.WriteQueue")
+			if m == nil {
+				continue
+			}
+			err := sendMessage(conn.Conn, m, timeout)
+			sr := newSendResult(conn.Addr(), m, err)
+			select {
+			case <-qc:
+				return nil
+			case pool.SendResults <- sr:
+			case <-time.After(sendResultTimeout):
+				logger.Warning("push send result channel timeout")
+			}
+
+			if err != nil {
+				return err
+			}
+
+			if err := pool.updateLastSent(conn.Addr(), Now()); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+func readData(reader io.Reader, buf []byte) ([]byte, error) {
+	c, err := reader.Read(buf)
+	if err != nil {
+		return nil, fmt.Errorf("read data failed: %v", err)
+	}
+	if c == 0 {
+		return nil, nil
+	}
+	data := make([]byte, c)
+	n := copy(data, buf)
+	if n != c {
+		// I don't believe this can ever occur
+		return nil, errors.New("Failed to copy all the bytes")
+	}
+	return data, nil
+}
+
+// decode data from buffer.
+func decodeData(buf *bytes.Buffer, maxMsgLength int) ([][]byte, error) {
+	dataArray := [][]byte{}
+	for buf.Len() > messageLengthSize {
 		//logger.Debug("There is data in the buffer, extracting")
-		prefix := c.Buffer.Bytes()[:messageLengthSize]
+		prefix := buf.Bytes()[:messageLengthSize]
 		// decode message length
 		tmpLength := uint32(0)
 		encoder.DeserializeAtomic(prefix, &tmpLength)
 		length := int(tmpLength)
-		//logger.Debug("Length is %d", length)
+		// logger.Debug("Length is %d", length)
 		// Disconnect if we received an invalid length.
 		if length < messagePrefixLength ||
-			length > self.Config.MaxMessageLength {
-			logger.Debug("Invalid message length %d received from %s",
-				length, c.Addr())
-			self.Disconnect(c, DisconnectInvalidMessageLength)
-			break
+			length > maxMsgLength {
+			return [][]byte{}, ErrDisconnectInvalidMessageLength
 		}
 
-		if c.Buffer.Len()-messageLengthSize < length {
-			//logger.Debug("Skipping, not enough data to read this")
-			break
+		if buf.Len()-messageLengthSize < length {
+			// logger.Debug("Skipping, not enough data to read this")
+			return [][]byte{}, nil
 		}
 
-		c.Buffer.Next(messageLengthSize) // strip the length prefix
-		data := c.Buffer.Next(length)    // read the message contents
-
-		//logger.Debug("Telling the message unpacker about this message")
-		err, dc := self.receiveMessage(c, data)
+		buf.Next(messageLengthSize) // strip the length prefix
+		data := make([]byte, length)
+		_, err := buf.Read(data)
 		if err != nil {
-			logger.Debug("Error with the event: %v", err)
-			self.Disconnect(c, DisconnectMalformedMessage)
-			break
+			return [][]byte{}, err
 		}
-		if dc != nil {
-			// The handler disconnected the connection, stop processing
-			break
+
+		dataArray = append(dataArray, data)
+	}
+	return dataArray, nil
+}
+
+// IsConnExist check if the connection of address does exist
+func (pool *ConnectionPool) IsConnExist(addr string) (bool, error) {
+	var exist bool
+	if err := pool.strand("IsConnExist", func() error {
+		if _, ok := pool.addresses[addr]; ok {
+			exist = true
 		}
+		return nil
+	}); err != nil {
+		return false, fmt.Errorf("Check connection existence failed: %v ", err)
 	}
+
+	return exist, nil
 }
 
-// Converts clients' connection buffers to messages as data is available
-func (self *ConnectionPool) processConnectionBuffers() {
-	for _, c := range self.Pool {
-		self.processConnectionBuffer(c)
+func (pool *ConnectionPool) updateLastSent(addr string, t time.Time) error {
+	return pool.strand("updateLastSent", func() error {
+		if conn, ok := pool.addresses[addr]; ok {
+			conn.LastSent = t
+		}
+		return nil
+	})
+}
+
+func (pool *ConnectionPool) updateLastRecv(addr string, t time.Time) error {
+	return pool.strand("updateLastRecv", func() error {
+		if conn, ok := pool.addresses[addr]; ok {
+			conn.LastReceived = t
+		}
+		return nil
+	})
+}
+
+// GetConnection returns a connection copy if exist
+func (pool *ConnectionPool) GetConnection(addr string) (*Connection, error) {
+	var conn *Connection
+	if err := pool.strand("GetConnection", func() error {
+		if c, ok := pool.addresses[addr]; ok {
+			// copy connection
+			var cc = *c
+			conn = &cc
+		}
+		return nil
+	}); err != nil {
+		return nil, err
 	}
+
+	return conn, nil
 }
 
-// Processes and clears pending messages
-func (self *ConnectionPool) HandleMessages() {
-	// Update the Pool for new connections. We do this here so that there is
-	// no contention for RW access to the pool or addresses (assuming
-	// HandleMessages() is in the same select as the DisconnectQueue
-	self.handleConnectionQueue()
+// Connect to an address
+func (pool *ConnectionPool) Connect(address string) error {
+	exist, err := pool.IsConnExist(address)
+	if err != nil {
+		return err
+	}
 
-	// Copy event data to the client's buffer
-	self.processEvents()
+	if exist {
+		return nil
+	}
 
-	// Process all messages from the client buffer
-	self.processConnectionBuffers()
+	logger.Debug("Making TCP Connection to %s", address)
+	conn, err := net.DialTimeout("tcp", address, pool.Config.DialTimeout)
+	if err != nil {
+		return err
+	}
+	pool.wg.Add(1)
+	go func() {
+		defer pool.wg.Done()
+		pool.handleConnection(conn, true)
+	}()
+	return nil
 }
 
-// Sends a Message to a Connection and pushes the result onto the
+// Disconnect removes a connection from the pool by address, and passes a Disconnection to
+// the DisconnectCallback
+func (pool *ConnectionPool) Disconnect(addr string, r DisconnectReason) error {
+	var exist bool
+	if err := pool.strand("Disconnect", func() error {
+		if conn, ok := pool.addresses[addr]; ok {
+			exist = true
+			delete(pool.pool, conn.ID)
+			delete(pool.addresses, addr)
+			conn.Close()
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	if pool.Config.DisconnectCallback != nil && exist {
+		pool.Config.DisconnectCallback(addr, r)
+	}
+
+	return nil
+}
+
+// GetConnections returns an copy of pool connections
+func (pool *ConnectionPool) GetConnections() ([]Connection, error) {
+	conns := []Connection{}
+	if err := pool.strand("GetConnections", func() error {
+		for _, conn := range pool.pool {
+			conns = append(conns, *conn)
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return conns, nil
+}
+
+// Size returns the pool size
+func (pool *ConnectionPool) Size() (l int, err error) {
+	err = pool.strand("Size", func() error {
+		l = len(pool.pool)
+		return nil
+	})
+	return
+}
+
+// SendMessage sends a Message to a Connection and pushes the result onto the
 // SendResults channel.
-func (self *ConnectionPool) SendMessage(c *Connection, msg Message) {
-
-	if DebugPrint {
+func (pool *ConnectionPool) SendMessage(addr string, msg Message) error {
+	if pool.Config.DebugPrint {
 		logger.Debug("Send, Msg Type: %s", reflect.TypeOf(msg))
 	}
 
-	select {
-	case c.WriteQueue <- msg:
-	default:
-		self.Disconnect(c, DisconnectWriteQueueFull)
-	}
+	return pool.strand("SendMessage", func() error {
+		if conn, ok := pool.addresses[addr]; ok {
+			select {
+			case conn.WriteQueue <- msg:
+			default:
+				return ErrDisconnectWriteQueueFull
+			}
+		}
+		return nil
+	})
 }
 
-//var MessageIdMap = make(map[reflect.Type]MessagePrefix)
-//t := reflect.TypeOf(msg)
-
-// Sends a Message to all connections in the Pool.
-func (self *ConnectionPool) BroadcastMessage(msg Message) {
-	if DebugPrint {
+// BroadcastMessage sends a Message to all connections in the Pool.
+func (pool *ConnectionPool) BroadcastMessage(msg Message) error {
+	if pool.Config.DebugPrint {
 		logger.Debug("Broadcast, Msg Type: %s", reflect.TypeOf(msg))
 	}
 
-	for _, c := range self.Pool {
-		self.SendMessage(c, msg)
+	fullWriteQueue := []string{}
+	if err := pool.strand("BroadcastMessage", func() error {
+		if len(pool.pool) == 0 {
+			return errors.New("Connection pool is empty")
+		}
+
+		for _, conn := range pool.pool {
+			select {
+			case conn.WriteQueue <- msg:
+			case <-time.After(5 * time.Second):
+				fullWriteQueue = append(fullWriteQueue, conn.Addr())
+			}
+		}
+		if len(fullWriteQueue) == len(pool.pool) {
+			return errors.New("There's no available connection in pool")
+		}
+
+		return nil
+	}); err != nil {
+		return err
 	}
+
+	for _, addr := range fullWriteQueue {
+		if err := pool.Disconnect(addr, ErrDisconnectWriteQueueFull); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Unpacks incoming bytes to a Message and calls the message handler.  If
 // the bytes cannot be converted to a Message, the error is returned as the
 // first return value.  Otherwise, error will be nil and DisconnectReason will
 // be the value returned from the message handler.
-func (self *ConnectionPool) receiveMessage(c *Connection,
-	msg []byte) (error, DisconnectReason) {
-	m, err := convertToMessage(c, msg)
+func (pool *ConnectionPool) receiveMessage(c *Connection, msg []byte) error {
+
+	m, err := convertToMessage(c.ID, msg, pool.Config.DebugPrint)
 	if err != nil {
-		return err, nil
+		return err
 	}
-	c.LastReceived = Now()
-	return nil, m.Handle(NewMessageContext(c), self.messageState)
-	//return nil, m.
-
-	//deprecate messageState
-
-	/*
-		For message prefix, look up the function
-		- then call reflect.Call(m map[string]interface{}, name string, params ... interface{}) (result []reflect.Value, err error)
-		- then convert the type
-
-	*/
-
+	if err := pool.updateLastRecv(c.Addr(), Now()); err != nil {
+		return err
+	}
+	return m.Handle(NewMessageContext(c), pool.messageState)
 }
 
-// Returns the current UTC time
+// SendPings sends a ping if our last message sent was over pingRate ago
+func (pool *ConnectionPool) SendPings(rate time.Duration, msg Message) error {
+	now := utc.Now()
+	var addrs []string
+	if err := pool.strand("SendPings", func() error {
+		for _, conn := range pool.pool {
+			if conn.LastSent.Add(rate).Before(now) {
+				addrs = append(addrs, conn.Addr())
+			}
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	for _, a := range addrs {
+		if err := pool.SendMessage(a, msg); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// ClearStaleConnections removes connections that have not sent a message in too long
+func (pool *ConnectionPool) ClearStaleConnections(idleLimit time.Duration, reason DisconnectReason) error {
+	now := Now()
+	idleConns := []string{}
+	if err := pool.strand("ClearStaleConnections", func() error {
+		for _, conn := range pool.pool {
+			if conn.LastReceived.Add(idleLimit).Before(now) {
+				idleConns = append(idleConns, conn.Addr())
+			}
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	for _, a := range idleConns {
+		pool.Disconnect(a, reason)
+	}
+	return nil
+}
+
+// Now returns the current UTC time
 func Now() time.Time {
-	return time.Now().UTC()
+	return utc.Now()
 }

@@ -1,25 +1,27 @@
 package cli
 
 import (
-	"errors"
 	"fmt"
 	"strconv"
 
-	"github.com/skycoin/skycoin/src/api/webrpc"
 	gcli "github.com/urfave/cli"
 )
 
-func init() {
-	cmd := gcli.Command{
-		Name:      "blocks",
-		Usage:     "Lists the content of a single block or a range of blocks",
-		ArgsUsage: "[starting block or single block seq] [ending block seq]",
-		Action:    getBlocks,
+func blocksCmd() gcli.Command {
+	name := "blocks"
+	return gcli.Command{
+		Name:         name,
+		Usage:        "Lists the content of a single block or a range of blocks",
+		ArgsUsage:    "[starting block or single block seq] [ending block seq]",
+		Action:       getBlocks,
+		OnUsageError: onCommandUsageError(name),
 	}
-	Commands = append(Commands, cmd)
+	// Commands = append(Commands, cmd)
 }
 
 func getBlocks(c *gcli.Context) error {
+	rpcClient := RpcClientFromContext(c)
+
 	// get start
 	start := c.Args().Get(0)
 	end := c.Args().Get(1)
@@ -27,32 +29,25 @@ func getBlocks(c *gcli.Context) error {
 		end = start
 	}
 
+	if start == "" {
+		gcli.ShowSubcommandHelp(c)
+		return nil
+	}
+
 	s, err := strconv.ParseUint(start, 10, 64)
 	if err != nil {
-		return errors.New("error block seq")
+		return fmt.Errorf("invalid block seq: %v, must be unsigned integer", start)
 	}
 
 	e, err := strconv.ParseUint(end, 10, 64)
 	if err != nil {
-		return errors.New("error block seq")
+		return fmt.Errorf("invalid block seq: %v, must be unsigned integer", end)
 	}
 
-	param := []uint64{s, e}
-
-	req, err := webrpc.NewRequest("get_blocks", param, "1")
+	rlt, err := rpcClient.GetBlocks(s, e)
 	if err != nil {
-		return fmt.Errorf("create rpc request failed: %v", err)
+		return err
 	}
 
-	rsp, err := webrpc.Do(req, rpcAddress)
-	if err != nil {
-		return fmt.Errorf("do rpc request failed: %v", err)
-	}
-
-	if rsp.Error != nil {
-		return fmt.Errorf("do rpc request failed: %+v", *rsp.Error)
-	}
-
-	fmt.Println(string(rsp.Result))
-	return nil
+	return printJson(rlt)
 }

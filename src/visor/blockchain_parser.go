@@ -2,93 +2,98 @@ package visor
 
 import (
 	"fmt"
-	"time"
 
+	"github.com/skycoin/skycoin/src/coin"
 	"github.com/skycoin/skycoin/src/visor/historydb"
 )
 
-const parseCycle = 10000 // millisecond
+// ParserOption option type which will be used when creating parser instance
+type ParserOption func(*BlockchainParser)
 
 // BlockchainParser parses the blockchain and stores the data into historydb.
 type BlockchainParser struct {
-	bc           *Blockchain
-	historyDB    *historydb.HistoryDB
-	parsedHeight uint64
-	closing      chan chan struct{}
+	historyDB *historydb.HistoryDB
+	blkC      chan coin.Block
+	quit      chan struct{}
+	done      chan struct{}
+	bc        *Blockchain
+
+	isStart bool
 }
 
 // NewBlockchainParser create and init the parser instance.
-func NewBlockchainParser(hisDB *historydb.HistoryDB, bc *Blockchain) *BlockchainParser {
-	return &BlockchainParser{
-		bc:           bc,
-		historyDB:    hisDB,
-		closing:      make(chan chan struct{}),
-		parsedHeight: 0,
+func NewBlockchainParser(hisDB *historydb.HistoryDB, bc *Blockchain, ops ...ParserOption) *BlockchainParser {
+	bp := &BlockchainParser{
+		bc:        bc,
+		historyDB: hisDB,
+		quit:      make(chan struct{}),
+		done:      make(chan struct{}),
+		blkC:      make(chan coin.Block, 10),
+	}
+
+	for _, op := range ops {
+		op(bp)
+	}
+
+	return bp
+}
+
+// FeedBlock feeds block to the parser
+func (bcp *BlockchainParser) FeedBlock(b coin.Block) {
+	bcp.blkC <- b
+}
+
+// Run starts blockchain parser
+func (bcp *BlockchainParser) Run() error {
+	logger.Info("Blockchain parser start")
+	defer close(bcp.done)
+	defer logger.Info("Blockchain parser closed")
+
+	if err := bcp.historyDB.ResetIfNeed(); err != nil {
+		return err
+	}
+
+	// parse to the blockchain head
+	headSeq := bcp.bc.HeadSeq()
+	if err := bcp.parseTo(headSeq); err != nil {
+		return err
+	}
+
+	for {
+		select {
+		case <-bcp.quit:
+			return nil
+		case b := <-bcp.blkC:
+			if err := bcp.historyDB.ParseBlock(&b); err != nil {
+				return err
+			}
+		}
 	}
 }
 
-// Start start to parse the blockchain.
-func (bcp *BlockchainParser) Start() {
-	go func() {
-		logger.Debug("start blockchain parser")
-		for {
-			select {
-			case cc := <-bcp.closing:
-				cc <- struct{}{}
-			default:
-				bcHeight := bcp.bc.Head().Seq()
-				if bcp.parsedHeight > bcHeight {
-					logger.Fatal("parsedHeight must be <= blockchain height seq")
-				}
-
-				if bcp.parsedHeight == bcHeight {
-					logger.Debug("no new block need to parse")
-					time.Sleep(time.Duration(parseCycle) * time.Millisecond)
-					continue
-				}
-
-				if err := bcp.parseTo(bcHeight); err != nil {
-					logger.Fatal(err)
-				}
-			}
-		}
-	}()
-}
-
-// Stop close the block parsing process.
-func (bcp *BlockchainParser) Stop() {
-	cc := make(chan struct{})
-	bcp.closing <- cc
-	<-cc
-	logger.Debug("blockchian parser stopped")
+// Shutdown close the block parsing process.
+func (bcp *BlockchainParser) Shutdown() {
+	close(bcp.quit)
+	<-bcp.done
 }
 
 func (bcp *BlockchainParser) parseTo(bcHeight uint64) error {
-	logger.Info("historydb parse %d/%d", bcp.parsedHeight, bcHeight)
-	if bcp.parsedHeight == 0 {
-		for i := uint64(0); i <= bcHeight-bcp.parsedHeight; i++ {
-			b := bcp.bc.GetBlockInDepth(bcp.parsedHeight + i)
-			if b == nil {
-				return fmt.Errorf("no block exist in depth:%d", bcp.parsedHeight+i)
-			}
+	parsedHeight := bcp.historyDB.ParsedHeight()
 
-			if err := bcp.historyDB.ProcessBlock(b); err != nil {
-				return err
-			}
+	for i := int64(0); i < int64(bcHeight)-parsedHeight; i++ {
+		b, err := bcp.bc.GetBlockBySeq(uint64(parsedHeight + i + 1))
+		if err != nil {
+			return err
 		}
-	} else {
-		for i := uint64(0); i < bcHeight-bcp.parsedHeight; i++ {
-			b := bcp.bc.GetBlockInDepth(bcp.parsedHeight + i + 1)
-			if b == nil {
-				return fmt.Errorf("no block exist in depth:%d", bcp.parsedHeight+i+1)
-			}
 
-			if err := bcp.historyDB.ProcessBlock(b); err != nil {
-				return err
-			}
+		if b == nil {
+			return fmt.Errorf("no block exist in depth:%d", parsedHeight+i+1)
+		}
+
+		if err := bcp.historyDB.ParseBlock(&b.Block); err != nil {
+			return err
 		}
 	}
-	bcp.parsedHeight = bcHeight
-	logger.Info("historydb parse %d/%d", bcHeight, bcHeight)
+
 	return nil
 }

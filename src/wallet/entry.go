@@ -2,115 +2,55 @@ package wallet
 
 import (
 	"errors"
-	"log"
 
 	"github.com/skycoin/skycoin/src/cipher"
 )
 
-// type WalletEntries []WalletEntry
-
-//Deprecate
-// func (self WalletEntries) ToArray() []WalletEntry {
-// 	e := make([]WalletEntry, len(self))
-// 	i := 0
-// 	for _, we := range self {
-// 		e[i] = we
-// 		i++
-// 	}
-// 	return e
-// }
-
-type WalletEntry struct {
+// Entry represents the wallet entry
+type Entry struct {
 	Address cipher.Address
 	Public  cipher.PubKey
 	Secret  cipher.SecKey
 }
 
-func NewWalletEntryFromKeypair(pub cipher.PubKey, sec cipher.SecKey) WalletEntry {
-	return WalletEntry{
-		Address: cipher.AddressFromPubKey(pub),
-		Public:  pub,
-		Secret:  sec,
-	}
-}
-
-func NewWalletEntry() WalletEntry {
-	pub, sec := cipher.GenerateKeyPair()
-	return NewWalletEntryFromKeypair(pub, sec)
-}
-
-func WalletEntryFromReadable(w *ReadableWalletEntry) WalletEntry {
-	// SimpleWallet entries are shared as a form of identification, the secret key
-	// is not required
-	// TODO -- fix lib/base58 to not panic on invalid input -- should
-	// return error, so we can detect a broken wallet.
-
-	if w.Address == "" {
-		//log.Panic("ReadableWalletEntry has no Address")
-	}
-	var s cipher.SecKey
-	if w.Secret != "" {
-		s = cipher.MustSecKeyFromHex(w.Secret)
+// NewEntryFromReadable creates WalletEntry base one ReadableWalletEntry
+func NewEntryFromReadable(w *ReadableEntry) (*Entry, error) {
+	if w.Secret == "" {
+		return nil, errors.New("secret field is empty")
 	}
 
-	//regen from the private key
-	//redundant/
-	if w.Address == "" {
-		addr := cipher.AddressFromSecKey(s)
-		pub := cipher.PubKeyFromSecKey(s)
+	s, err := cipher.SecKeyFromHex(w.Secret)
+	if err != nil {
+		return nil, err
+	}
 
-		return WalletEntry{
-			Address: addr,
-			Public:  pub,
-			Secret:  s,
+	a := cipher.AddressFromSecKey(s)
+	if w.Address != "" {
+		if a.String() != w.Address {
+			return nil, errors.New("address does not match the secret")
 		}
 	}
 
-	return WalletEntry{
-		Address: cipher.MustDecodeBase58Address(w.Address),
-		Public:  cipher.MustPubKeyFromHex(w.Public),
+	return &Entry{
+		Address: a,
+		Public:  cipher.PubKeyFromSecKey(s),
 		Secret:  s,
-	}
+	}, nil
 }
 
-// Loads a WalletEntry from filename, where the file contains a
-// ReadableWalletEntry
-func LoadWalletEntry(filename string) (WalletEntry, error) {
-	w, err := LoadReadableWalletEntry(filename)
-	if err != nil {
-		return WalletEntry{}, err
-	} else {
-		return WalletEntryFromReadable(&w), nil
-	}
-}
-
-// Loads a WalletEntry from filename but panics is unable to load or contents
-// are invalid
-func MustLoadWalletEntry(filename string) WalletEntry {
-	keys, err := LoadWalletEntry(filename)
-	if err != nil {
-		log.Panicf("Failed to load wallet entry: %v", err)
-	}
-	if err := keys.Verify(); err != nil {
-		log.Panicf("Invalid wallet entry: %v", err)
-	}
-	return keys
-}
-
-// Checks that the public key is derivable from the secret key,
+// Verify checks that the public key is derivable from the secret key,
 // and that the public key is associated with the address
-func (self *WalletEntry) Verify() error {
-	if cipher.PubKeyFromSecKey(self.Secret) != self.Public {
-		return errors.New("Invalid public key for secret key")
+func (we *Entry) Verify() error {
+	if cipher.PubKeyFromSecKey(we.Secret) != we.Public {
+		return errors.New("invalid public key for secret key")
 	}
-	return self.VerifyPublic()
+	return we.VerifyPublic()
 }
 
-// Checks that the public key is associated with the address
-func (self *WalletEntry) VerifyPublic() error {
-	if err := self.Public.Verify(); err != nil {
+// VerifyPublic checks that the public key is associated with the address
+func (we *Entry) VerifyPublic() error {
+	if err := we.Public.Verify(); err != nil {
 		return err
-	} else {
-		return self.Address.Verify(self.Public)
 	}
+	return we.Address.Verify(we.Public)
 }

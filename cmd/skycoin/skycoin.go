@@ -1,15 +1,19 @@
 package main
 
 import (
+	"bytes"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"runtime/pprof"
+	"sync"
 	"syscall"
 	"time"
 
@@ -18,55 +22,73 @@ import (
 	"github.com/skycoin/skycoin/src/coin"
 	"github.com/skycoin/skycoin/src/daemon"
 	"github.com/skycoin/skycoin/src/gui"
-	"github.com/skycoin/skycoin/src/util"
-	"github.com/skycoin/skycoin/src/visor/blockdb"
-	"gopkg.in/op/go-logging.v1"
+	"github.com/skycoin/skycoin/src/util/browser"
+	"github.com/skycoin/skycoin/src/util/cert"
+	"github.com/skycoin/skycoin/src/util/file"
+	"github.com/skycoin/skycoin/src/util/logging"
+	"github.com/skycoin/skycoin/src/visor"
 )
 
-//"github.com/skycoin/skycoin/src/cli"
-
-//"github.com/skycoin/skycoin/src/wallet"
-
 var (
-	logger     = logging.MustGetLogger("skycoin.main")
-	logFormat  = "[%{module}:%{level}] %{message}"
+	// Version node version which will be set when build wallet by LDFLAGS
+	Version = "0.21.1"
+	// Commit id
+	Commit = ""
+
+	help = false
+
+	logger     = logging.MustGetLogger("main")
+	logFormat  = "[skycoin.%{module}:%{level}] %{message}"
 	logModules = []string{
-		"skycoin.main",
-		"skycoin.daemon",
-		"skycoin.coin",
-		"skycoin.gui",
-		"skycoin.util",
-		"skycoin.visor",
-		"skycoin.wallet",
+		"main",
+		"daemon",
+		"coin",
+		"gui",
+		"file",
+		"visor",
+		"wallet",
 		"gnet",
 		"pex",
+		"webrpc",
 	}
 
-	//TODO: Move time and other genesis block settigns from visor, to here
+	// GenesisSignatureStr hex string of genesis signature
 	GenesisSignatureStr = "eb10468d10054d15f2b6f8946cd46797779aa20a7617ceb4be884189f219bc9a164e56a5b9f7bec392a804ff3740210348d73db77a37adb542a8e08d429ac92700"
-	GenesisAddressStr   = "2jBbGxZRGoQG1mqhPBnXnLTxK6oxsTf8os6"
+	// GenesisAddressStr genesis address string
+	GenesisAddressStr = "2jBbGxZRGoQG1mqhPBnXnLTxK6oxsTf8os6"
+	// BlockchainPubkeyStr pubic key string
 	BlockchainPubkeyStr = "0328c576d3f420e7682058a981173a4b374c7cc5ff55bf394d3cf57059bbe6456a"
+	// BlockchainSeckeyStr empty private key string
 	BlockchainSeckeyStr = ""
 
-	GenesisTimestamp  uint64 = 1426562704
+	// GenesisTimestamp genesis block create unix time
+	GenesisTimestamp uint64 = 1426562704
+	// GenesisCoinVolume represents the coin capacity
 	GenesisCoinVolume uint64 = 100e12
 
-	//GenesisTimestamp: 1426562704,
-	//GenesisCoinVolume: 100e12, //100e6 * 10e6
-
+	// DefaultConnections the default trust node addresses
 	DefaultConnections = []string{
-		"13.76.90.237:6000",
-		"40.74.142.139:6000",
-		"188.226.245.87:6000",
-		"40.74.80.119:6000",
+		"118.178.135.93:6000",
+		"47.88.33.156:6000",
+		"121.41.103.148:6000",
+		"120.77.69.188:6000",
+		"104.237.142.206:6000",
+		"176.58.126.224:6000",
+		"172.104.85.6:6000",
+		"139.162.7.132:6000",
 	}
 )
 
 // Command line interface arguments
 
+// Config records the node's configuration
 type Config struct {
 	// Disable peer exchange
 	DisablePEX bool
+	// Download peer list
+	DownloadPeerList bool
+	// Download the peers list from this URL
+	PeerListURL string
 	// Don't make any outgoing connections
 	DisableOutgoingConnections bool
 	// Don't allowing incoming connections
@@ -80,10 +102,12 @@ type Config struct {
 	Address string
 	//gnet uses this for TCP incoming and outgoing
 	Port int
-	//max connections to maintain
-	MaxConnections int
+	//max outgoing connections to maintain
+	MaxOutgoingConnections int
 	// How often to make outgoing connections
 	OutgoingConnectionsRate time.Duration
+	// PeerlistSize represents the maximum number of peers that the pex would maintain
+	PeerlistSize int
 	// Wallet Address Version
 	//AddressVersion string
 	// Remote web interface
@@ -93,6 +117,10 @@ type Config struct {
 	WebInterfaceCert  string
 	WebInterfaceKey   string
 	WebInterfaceHTTPS bool
+
+	RPCInterface     bool
+	RPCInterfacePort int
+	RPCInterfaceAddr string
 
 	// Launch System Default Browser after client startup
 	LaunchBrowser bool
@@ -104,19 +132,17 @@ type Config struct {
 	DataDirectory string
 	// GUI directory contains assets for the html gui
 	GUIDirectory string
+
 	// Logging
-	LogLevel logging.Level
 	ColorLog bool
 	// This is the value registered with flag, it is converted to LogLevel after parsing
-	logLevel string
+	LogLevel string
+	// Disable "Reply to ping", "Received pong" log messages
+	DisablePingPong bool
 
 	// Wallets
 	// Defaults to ${DataDirectory}/wallets/
 	WalletDirectory string
-	BlockchainFile  string
-	BlockSigsFile   string
-
-	// Centralized network configuration
 
 	RunMaster bool
 
@@ -138,17 +164,26 @@ type Config struct {
 	// Will force it to connect to this ip:port, instead of waiting for it
 	// to show up as a peer
 	ConnectTo string
+
+	DBPath       string
+	Arbitrating  bool
+	RPCThreadNum uint // rpc number
+	Logtofile    bool
+	Logtogui     bool
+	LogBuffSize  int
 }
 
 func (c *Config) register() {
+	flag.BoolVar(&help, "help", false, "Show help")
 	flag.BoolVar(&c.DisablePEX, "disable-pex", c.DisablePEX,
 		"disable PEX peer discovery")
+	flag.BoolVar(&c.DownloadPeerList, "download-peerlist", c.DownloadPeerList, "download a peers.txt from -peerlist-url")
+	flag.StringVar(&c.PeerListURL, "peerlist-url", c.PeerListURL, "with -download-peerlist=true, download a peers.txt file from this url")
 	flag.BoolVar(&c.DisableOutgoingConnections, "disable-outgoing",
 		c.DisableOutgoingConnections, "Don't make outgoing connections")
 	flag.BoolVar(&c.DisableIncomingConnections, "disable-incoming",
 		c.DisableIncomingConnections, "Don't make incoming connections")
-	flag.BoolVar(&c.DisableNetworking, "disable-networking",
-		c.DisableNetworking, "Disable all network activity")
+	flag.BoolVar(&c.DisableNetworking, "disable-networking", c.DisableNetworking, "Disable all network activity")
 	flag.StringVar(&c.Address, "address", c.Address,
 		"IP Address to run application on. Leave empty to default to a public interface")
 	flag.IntVar(&c.Port, "port", c.Port, "Port to run application on")
@@ -166,6 +201,15 @@ func (c *Config) register() {
 			"If not provided, will use key.pem in -data-directory")
 	flag.BoolVar(&c.WebInterfaceHTTPS, "web-interface-https",
 		c.WebInterfaceHTTPS, "enable HTTPS for web interface")
+
+	flag.BoolVar(&c.RPCInterface, "rpc-interface", c.RPCInterface,
+		"enable the rpc interface")
+	flag.IntVar(&c.RPCInterfacePort, "rpc-interface-port", c.RPCInterfacePort,
+		"port to serve rpc interface on")
+	flag.StringVar(&c.RPCInterfaceAddr, "rpc-interface-addr", c.RPCInterfaceAddr,
+		"addr to serve rpc interface on")
+	flag.UintVar(&c.RPCThreadNum, "rpc-thread-num", 5, "rpc thread number")
+
 	flag.BoolVar(&c.LaunchBrowser, "launch-browser", c.LaunchBrowser,
 		"launch system default webbrowser at client startup")
 	flag.BoolVar(&c.PrintWebInterfaceAddress, "print-web-interface-address",
@@ -180,10 +224,13 @@ func (c *Config) register() {
 		c.ProfileCPUFile, "where to write the cpu profile file")
 	flag.BoolVar(&c.HTTPProf, "http-prof", c.HTTPProf,
 		"Run the http profiling interface")
-	flag.StringVar(&c.logLevel, "log-level", c.logLevel,
+	flag.StringVar(&c.LogLevel, "log-level", c.LogLevel,
 		"Choices are: debug, info, notice, warning, error, critical")
 	flag.BoolVar(&c.ColorLog, "color-log", c.ColorLog,
 		"Add terminal colors to log output")
+	flag.BoolVar(&c.DisablePingPong, "no-ping-log", false,
+		`disable "reply to ping" and "received pong" log messages`)
+	flag.BoolVar(&c.Logtofile, "logtofile", false, "log to file")
 	flag.StringVar(&c.GUIDirectory, "gui-dir", c.GUIDirectory,
 		"static content directory for the html gui")
 
@@ -205,23 +252,20 @@ func (c *Config) register() {
 
 	flag.StringVar(&c.WalletDirectory, "wallet-dir", c.WalletDirectory,
 		"location of the wallet files. Defaults to ~/.skycoin/wallet/")
-
-	flag.StringVar(&c.BlockchainFile, "blockchain-file", c.BlockchainFile,
-		"location of the blockchain file. Default to ~/.skycoin/blockchain.bin")
-	flag.StringVar(&c.BlockSigsFile, "blocksigs-file", c.BlockSigsFile,
-		"location of the block signatures file. Default to ~/.skycoin/blockchain.sigs")
-
+	flag.IntVar(&c.MaxOutgoingConnections, "max-outgoing-connections", 16, "The maximum outgoing connections allowed")
+	flag.IntVar(&c.PeerlistSize, "peerlist-size", 65535, "The peer list size")
 	flag.DurationVar(&c.OutgoingConnectionsRate, "connection-rate",
 		c.OutgoingConnectionsRate, "How often to make an outgoing connection")
 	flag.BoolVar(&c.LocalhostOnly, "localhost-only", c.LocalhostOnly,
 		"Run on localhost and only connect to localhost peers")
-	//flag.StringVar(&c.AddressVersion, "address-version", c.AddressVersion,
-	//	"Wallet address version. Options are 'test' and 'main'")
+	flag.BoolVar(&c.Arbitrating, "arbitrating", c.Arbitrating, "Run node in arbitrating mode")
+	flag.BoolVar(&c.Logtogui, "logtogui", true, "log to gui")
+	flag.IntVar(&c.LogBuffSize, "logbufsize", c.LogBuffSize, "Log size saved in memeory for gui show")
 }
 
-var devConfig Config = Config{
+var devConfig = Config{
 	// Disable peer exchange
-	DisablePEX: true,
+	DisablePEX: false,
 	// Don't make any outgoing connections
 	DisableOutgoingConnections: false,
 	// Don't allowing incoming connections
@@ -235,10 +279,13 @@ var devConfig Config = Config{
 	Address: "",
 	//gnet uses this for TCP incoming and outgoing
 	Port: 6000,
-
-	MaxConnections: 16,
+	// MaxOutgoingConnections is the maximum outgoing connections allowed.
+	MaxOutgoingConnections: 16,
+	DownloadPeerList:       false,
+	PeerListURL:            "https://downloads.skycoin.net/blockchain/peers.txt",
 	// How often to make outgoing connections, in seconds
 	OutgoingConnectionsRate: time.Second * 5,
+	PeerlistSize:            65535,
 	// Wallet Address Version
 	//AddressVersion: "test",
 	// Remote web interface
@@ -249,20 +296,23 @@ var devConfig Config = Config{
 	WebInterfaceKey:          "",
 	WebInterfaceHTTPS:        false,
 	PrintWebInterfaceAddress: false,
-	LaunchBrowser:            true,
+
+	RPCInterface:     true,
+	RPCInterfacePort: 6430,
+	RPCInterfaceAddr: "127.0.0.1",
+	RPCThreadNum:     5,
+
+	LaunchBrowser: true,
 	// Data directory holds app data -- defaults to ~/.skycoin
 	DataDirectory: ".skycoin",
 	// Web GUI static resources
 	GUIDirectory: "./src/gui/static/",
 	// Logging
-	LogLevel: logging.DEBUG,
 	ColorLog: true,
-	logLevel: "DEBUG",
+	LogLevel: "DEBUG",
 
 	// Wallets
 	WalletDirectory: "",
-	BlockchainFile:  "",
-	BlockSigsFile:   "",
 
 	// Centralized network configuration
 	RunMaster:        false,
@@ -283,12 +333,18 @@ var devConfig Config = Config{
 	HTTPProf: false,
 	// Will force it to connect to this ip:port, instead of waiting for it
 	// to show up as a peer
-	ConnectTo: "",
+	ConnectTo:   "",
+	LogBuffSize: 8388608, //1024*1024*8
 }
 
+// Parse prepare the config
 func (c *Config) Parse() {
 	c.register()
 	flag.Parse()
+	if help {
+		flag.Usage()
+		os.Exit(0)
+	}
 	c.postProcess()
 }
 
@@ -315,7 +371,9 @@ func (c *Config) postProcess() {
 		c.BlockchainSeckey = cipher.SecKey{}
 	}
 
-	c.DataDirectory = util.InitDataDir(c.DataDirectory)
+	c.DataDirectory, err = file.InitDataDir(c.DataDirectory)
+	panicIfError(err, "Invalid DataDirectory")
+
 	if c.WebInterfaceCert == "" {
 		c.WebInterfaceCert = filepath.Join(c.DataDirectory, "cert.pem")
 	}
@@ -323,20 +381,13 @@ func (c *Config) postProcess() {
 		c.WebInterfaceKey = filepath.Join(c.DataDirectory, "key.pem")
 	}
 
-	if c.BlockchainFile == "" {
-		c.BlockchainFile = filepath.Join(c.DataDirectory, "blockchain.bin")
-	}
-	if c.BlockSigsFile == "" {
-		c.BlockSigsFile = filepath.Join(c.DataDirectory, "blockchain.sigs")
-	}
 	if c.WalletDirectory == "" {
-		c.WalletDirectory = filepath.Join(c.DataDirectory, "wallets/")
+		c.WalletDirectory = filepath.Join(c.DataDirectory, "wallets")
 	}
 
-	ll, err := logging.LogLevel(c.logLevel)
-	panicIfError(err, "Invalid -log-level %s", c.logLevel)
-	c.LogLevel = ll
-
+	if c.DBPath == "" {
+		c.DBPath = filepath.Join(c.DataDirectory, "data.db")
+	}
 }
 
 func panicIfError(err error, msg string, args ...interface{}) {
@@ -362,12 +413,12 @@ func printProgramStatus() {
 	}
 }
 
-func catchInterrupt(quit chan<- int) {
+func catchInterrupt(quit chan<- struct{}) {
 	sigchan := make(chan os.Signal, 1)
 	signal.Notify(sigchan, os.Interrupt)
 	<-sigchan
 	signal.Stop(sigchan)
-	quit <- 1
+	close(quit)
 }
 
 // Catches SIGUSR1 and prints internal program state
@@ -383,15 +434,51 @@ func catchDebug() {
 	}
 }
 
-func initLogging(level logging.Level, color bool) {
-	format := logging.MustStringFormatter(logFormat)
-	logging.SetFormatter(format)
-	for _, s := range logModules {
-		logging.SetLevel(level, s)
+// init logging settings
+func initLogging(dataDir string, level string, color, logtofile, logtogui bool, logbuf *bytes.Buffer) (func(), error) {
+	logCfg := logging.DevLogConfig(logModules)
+	logCfg.Format = logFormat
+	logCfg.Colors = color
+	logCfg.Level = level
+
+	var fd *os.File
+	if logtofile {
+		logDir := filepath.Join(dataDir, "logs")
+		if err := createDirIfNotExist(logDir); err != nil {
+			log.Println("initial logs folder failed", err)
+			return nil, fmt.Errorf("init log folder fail, %v", err)
+		}
+
+		// open log file
+		tf := "2006-01-02-030405"
+		logfile := filepath.Join(logDir,
+			fmt.Sprintf("%s-v%s.log", time.Now().Format(tf), Version))
+		var err error
+		fd, err = os.OpenFile(logfile, os.O_RDWR|os.O_CREATE, 0666)
+		if err != nil {
+			return nil, err
+		}
+
+		if logtogui {
+			logCfg.Output = io.MultiWriter(os.Stdout, fd, logbuf)
+		} else {
+			logCfg.Output = io.MultiWriter(os.Stdout, fd)
+		}
+
+	} else {
+		if logtogui {
+			logCfg.Output = io.MultiWriter(os.Stdout, logbuf)
+		}
 	}
-	stdout := logging.NewLogBackend(os.Stdout, "", 0)
-	stdout.Color = color
-	logging.SetBackend(stdout)
+
+	logCfg.InitLogger()
+
+	return func() {
+		logger.Info("Log file closed")
+		if fd != nil {
+			fd.Close()
+		}
+	}, nil
 }
 
 func initProfiling(httpProf, profileCPU bool, profileCPUFile string) {
@@ -412,27 +499,26 @@ func initProfiling(httpProf, profileCPU bool, profileCPUFile string) {
 
 func configureDaemon(c *Config) daemon.Config {
 	//cipher.SetAddressVersion(c.AddressVersion)
-
 	dc := daemon.NewConfig()
-	dc.Peers.DataDirectory = c.DataDirectory
-	dc.Peers.Disabled = c.DisablePEX
+	dc.Pex.DataDirectory = c.DataDirectory
+	dc.Pex.Disabled = c.DisablePEX
+	dc.Pex.Max = c.PeerlistSize
+	dc.Pex.DownloadPeerList = c.DownloadPeerList
+	dc.Pex.PeerListURL = c.PeerListURL
 	dc.Daemon.DisableOutgoingConnections = c.DisableOutgoingConnections
 	dc.Daemon.DisableIncomingConnections = c.DisableIncomingConnections
 	dc.Daemon.DisableNetworking = c.DisableNetworking
 	dc.Daemon.Port = c.Port
 	dc.Daemon.Address = c.Address
 	dc.Daemon.LocalhostOnly = c.LocalhostOnly
-	dc.Daemon.OutgoingMax = c.MaxConnections
-
-	daemon.DefaultConnections = DefaultConnections
+	dc.Daemon.OutgoingMax = c.MaxOutgoingConnections
+	dc.Daemon.DataDirectory = c.DataDirectory
+	dc.Daemon.LogPings = !c.DisablePingPong
 
 	if c.OutgoingConnectionsRate == 0 {
 		c.OutgoingConnectionsRate = time.Millisecond
 	}
 	dc.Daemon.OutgoingRate = c.OutgoingConnectionsRate
-
-	dc.Visor.Config.BlockchainFile = c.BlockchainFile
-	dc.Visor.Config.BlockSigsFile = c.BlockSigsFile
 
 	dc.Visor.Config.IsMaster = c.RunMaster
 
@@ -443,12 +529,26 @@ func configureDaemon(c *Config) daemon.Config {
 	dc.Visor.Config.GenesisSignature = c.GenesisSignature
 	dc.Visor.Config.GenesisTimestamp = c.GenesisTimestamp
 	dc.Visor.Config.GenesisCoinVolume = GenesisCoinVolume
+	dc.Visor.Config.DBPath = c.DBPath
+	dc.Visor.Config.Arbitrating = c.Arbitrating
+	dc.Visor.Config.WalletDirectory = c.WalletDirectory
+	dc.Visor.Config.BuildInfo = visor.BuildInfo{
+		Version: Version,
+		Commit:  Commit,
+	}
 	return dc
 }
 
+// Run starts the skycoin node
 func Run(c *Config) {
+	defer func() {
+		// try catch panic in main thread
+		if r := recover(); r != nil {
+			logger.Error("recover: %v\nstack:%v", r, string(debug.Stack()))
+		}
+	}()
 
-	c.GUIDirectory = util.ResolveResourceDirectory(c.GUIDirectory)
+	c.GUIDirectory = file.ResolveResourceDirectory(c.GUIDirectory)
 
 	scheme := "http"
 	if c.WebInterfaceHTTPS {
@@ -464,39 +564,98 @@ func Run(c *Config) {
 	}
 
 	initProfiling(c.HTTPProf, c.ProfileCPU, c.ProfileCPUFile)
-	initLogging(c.LogLevel, c.ColorLog)
 
-	// start the block db.
-	blockdb.Start()
-	defer blockdb.Stop()
-
-	// start the transaction db.
-	// transactiondb.Start()
-	// defer transactiondb.Stop()
+	var wg sync.WaitGroup
 
 	// If the user Ctrl-C's, shutdown properly
-	quit := make(chan int)
-	go catchInterrupt(quit)
+	quit := make(chan struct{})
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		catchInterrupt(quit)
+	}()
+
 	// Watch for SIGUSR1
-	go catchDebug()
+	wg.Add(1)
+	func() {
+		defer wg.Done()
+		go catchDebug()
+	}()
 
-	gui.InitWalletRPC(c.WalletDirectory)
-
+	// creates blockchain instance
 	dconf := configureDaemon(c)
-	d := daemon.NewDaemon(dconf)
 
-	stopDaemon := make(chan int)
-	go d.Start(stopDaemon)
+	db, err := visor.OpenDB(dconf.Visor.Config.DBPath)
+	if err != nil {
+		logger.Error("Database failed to open: %v. Is another skycoin instance running?", err)
+		return
+	}
 
+	d, err := daemon.NewDaemon(dconf, db, DefaultConnections)
+	if err != nil {
+		logger.Error("%v", err)
+		return
+	}
+
+	closelog, err := initLogging(c.DataDirectory, c.LogLevel, c.ColorLog, c.Logtofile, c.Logtogui, &d.LogBuff)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	if c.Logtogui {
+		go func(buf *bytes.Buffer, quit chan struct{}) {
+			for {
+				select {
+				case <-quit:
+					logger.Info("Logbuff service closed normally")
+					return
+				case <-time.After(1 * time.Second): //insure logbuff size not exceed required size, like lru
+					for buf.Len() > c.LogBuffSize {
+						_, err := buf.ReadString(byte('\n')) //discard one line
+						if err != nil {
+							continue
+						}
+					}
+				}
+			}
+		}(&d.LogBuff, quit)
+	}
+
+	errC := make(chan error, 1)
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		d.Run()
+	}()
+
+	var rpc *webrpc.WebRPC
 	// start the webrpc
-	closingC := make(chan struct{})
-	go webrpc.Start("0.0.0.0:6422", 1000, 1000, d.Gateway, closingC)
+	if c.RPCInterface {
+		rpcAddr := fmt.Sprintf("%v:%v", c.RPCInterfaceAddr, c.RPCInterfacePort)
+		rpc, err = webrpc.New(rpcAddr, d.Gateway)
+		if err != nil {
+			logger.Error("%v", err)
+			return
+		}
+		rpc.ChanBuffSize = 1000
+		rpc.WorkerNum = c.RPCThreadNum
+
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := rpc.Run(); err != nil {
+				errC <- err
+			}
+		}()
+	}
 
 	// Debug only - forces connection on start.  Violates thread safety.
 	if c.ConnectTo != "" {
-		_, err := d.Pool.Pool.Connect(c.ConnectTo)
-		if err != nil {
-			log.Panic(err)
+		if err := d.Pool.Pool.Connect(c.ConnectTo); err != nil {
+			logger.Error("Force connect %s failed, %v", c.ConnectTo, err)
+			return
 		}
 	}
 
@@ -504,13 +663,13 @@ func Run(c *Config) {
 		var err error
 		if c.WebInterfaceHTTPS {
 			// Verify cert/key parameters, and if neither exist, create them
-			errs := util.CreateCertIfNotExists(host, c.WebInterfaceCert, c.WebInterfaceKey, "Skycoind")
+			errs := cert.CreateCertIfNotExists(host, c.WebInterfaceCert, c.WebInterfaceKey, "Skycoind")
 			if len(errs) != 0 {
 				for _, err := range errs {
 					logger.Error(err.Error())
 				}
 				logger.Error("gui.CreateCertIfNotExists failure")
-				os.Exit(1)
+				return
 			}
 
 			err = gui.LaunchWebInterfaceHTTPS(host, c.GUIDirectory, d, c.WebInterfaceCert, c.WebInterfaceKey)
@@ -521,17 +680,21 @@ func Run(c *Config) {
 		if err != nil {
 			logger.Error(err.Error())
 			logger.Error("Failed to start web GUI")
-			os.Exit(1)
+			return
 		}
 
 		if c.LaunchBrowser {
+			wg.Add(1)
 			go func() {
+				defer wg.Done()
+
 				// Wait a moment just to make sure the http interface is up
 				time.Sleep(time.Millisecond * 100)
 
 				logger.Info("Launching System Browser with %s", fullAddress)
-				if err := util.OpenBrowser(fullAddress); err != nil {
+				if err := browser.Open(fullAddress); err != nil {
 					logger.Error(err.Error())
+					return
 				}
 			}()
 		}
@@ -547,145 +710,65 @@ func Run(c *Config) {
 		}
 	*/
 
-	<-quit
-	stopDaemon <- 1
-	close(closingC)
+	/*
+		//first transaction
+		if c.RunMaster == true {
+			go func() {
+				for d.Visor.Visor.Blockchain.Head().Seq() < 2 {
+					time.Sleep(5)
+					tx := InitTransaction()
+					err, _ := d.Visor.Visor.InjectTxn(tx)
+					if err != nil {
+						//log.Panic(err)
+					}
+				}
+			}()
+		}
+	*/
 
-	logger.Info("Shutting down")
+	select {
+	case <-quit:
+	case err := <-errC:
+		logger.Error("%v", err)
+	}
+
+	logger.Info("Shutting down...")
+	if rpc != nil {
+		rpc.Shutdown()
+	}
+	gui.Shutdown()
 	d.Shutdown()
+	closelog()
+	wg.Wait()
 	logger.Info("Goodbye")
 }
 
 func main() {
-
-	/*
-		skycoin.Run(&cli.DaemonArgs)
-	*/
-
-	/*
-	   skycoin.Run(&cli.ClientArgs)
-	   stop := make(chan int)
-	   <-stop
-	*/
-
-	//skycoin.Run(&cli.DevArgs)
 	devConfig.Parse()
 	Run(&devConfig)
 }
 
-//addresses for storage of coins
-var AddrList []string = []string{
-	"R6aHqKWSQfvpdo2fGSrq4F1RYXkBWR9HHJ",
-	"2EYM4WFHe4Dgz6kjAdUkM6Etep7ruz2ia6h",
-	"25aGyzypSA3T9K6rgPUv1ouR13efNPtWP5m",
-	"ix44h3cojvN6nqGcdpy62X7Rw6Ahnr3Thk",
-	"AYV8KEBEAPCg8a59cHgqHMqYHP9nVgQDyW",
-	"2Nu5Jv5Wp3RYGJU1EkjWFFHnebxMx1GjfkF",
-	"2THDupTBEo7UqB6dsVizkYUvkKq82Qn4gjf",
-	"tWZ11Nvor9parjg4FkwxNVcby59WVTw2iL",
-	"m2joQiJRZnj3jN6NsoKNxaxzUTijkdRoSR",
-	"8yf8PAQqU2cDj8Yzgz3LgBEyDqjvCh2xR7",
-	"sgB3n11ZPUYHToju6TWMpUZTUcKvQnoFMJ",
-	"2UYPbDBnHUEc67e7qD4eXtQQ6zfU2cyvAvk",
-	"wybwGC9rhm8ZssBuzpy5goXrAdE31MPdsj",
-	"JbM25o7kY7hqJZt3WGYu9pHZFCpA9TCR6t",
-	"2efrft5Lnwjtk7F1p9d7BnPd72zko2hQWNi",
-	"Syzmb3MiMoiNVpqFdQ38hWgffHg86D2J4e",
-	"2g3GUmTQooLrNHaRDhKtLU8rWLz36Beow7F",
-	"D3phtGr9iv6238b3zYXq6VgwrzwvfRzWZQ",
-	"gpqsFSuMCZmsjPc6Rtgy1FmLx424tH86My",
-	"2EUF3GPEUmfocnUc1w6YPtqXVCy3UZA4rAq",
-	"TtAaxB3qGz5zEAhhiGkBY9VPV7cekhvRYS",
-	"2fM5gVpi7XaiMPm4i29zddTNkmrKe6TzhVZ",
-	"ix3NDKgxfYYANKAb5kbmwBYXPrkAsha7uG",
-	"2RkPshpFFrkuaP98GprLtgHFTGvPY5e6wCK",
-	"Ak1qCDNudRxZVvcW6YDAdD9jpYNNStAVqm",
-	"2eZYSbzBKJ7QCL4kd5LSqV478rJQGb4UNkf",
-	"KPfqM6S96WtRLMuSy4XLfVwymVqivdcDoM",
-	"5B98bU1nsedGJBdRD5wLtq7Z8t8ZXio8u5",
-	"2iZWk5tmBynWxj2PpAFyiZzEws9qSnG3a6n",
-	"XUGdPaVnMh7jtzPe3zkrf9FKh5nztFnQU5",
-	"hSNgHgewJme8uaHrEuKubHYtYSDckD6hpf",
-	"2DeK765jLgnMweYrMp1NaYHfzxumfR1PaQN",
-	"orrAssY5V2HuQAbW9K6WktFrGieq2m23pr",
-	"4Ebf4PkG9QEnQTm4MVvaZvJV6Y9av3jhgb",
-	"7Uf5xJ3GkiEKaLxC2WmJ1t6SeekJeBdJfu",
-	"oz4ytDKbCqpgjW3LPc52pW2CaK2gxCcWmL",
-	"2ex5Z7TufQ5Z8xv5mXe53fSQRfUr35SSo7Q",
-	"WV2ap7ZubTxeDdmEZ1Xo7ufGMkekLWikJu",
-	"ckCTV4r1pNuz6j2VBRHhaJN9HsCLY7muLV",
-	"MXJx96ZJVSjktgeYZpVK8vn1H3xWP8ooq5",
-	"wyQVmno9aBJZmQ99nDSLoYWwp7YDJCWsrH",
-	"2cc9wKxCsFNRkoAQDAoHke3ZoyL1mSV14cj",
-	"29k9g3F5AYfVaa1joE1PpZjBED6hQXes8Mm",
-	"2XPLzz4ZLf1A9ykyTCjW5gEmVjnWa8CuatH",
-	"iH7DqqojTgUn2JxmY9hgFp165Nk7wKfan9",
-	"RJzzwUs3c9C8Y7NFYzNfFoqiUKeBhBfPki",
-	"2W2cGyiCRM4nwmmiGPgMuGaPGeBzEm7VZPn",
-	"ALJVNKYL7WGxFBSriiZuwZKWD4b7fbV1od",
-	"tBaeg9zE2sgmw5ZQENaPPYd6jfwpVpGTzS",
-	"2hdTw5Hk3rsgpZjvk8TyKcCZoRVXU5QVrUt",
-	"A1QU6jKq8YgTP79M8fwZNHUZc7hConFKmy",
-	"q9RkXoty3X1fuaypDDRUi78rWgJWYJMmpJ",
-	"2Xvm6is5cAPA85xnSYXDuAqiRyoXiky5RaD",
-	"4CW2CPJEzxhn2PS4JoSLoWGL5QQ7dL2eji",
-	"24EG6uTzL7DHNzcwsygYGRR1nfu5kco7AZ1",
-	"KghGnWw5fppTrqHSERXZf61yf7GkuQdCnV",
-	"2WojewRA3LbpyXTP9ANy8CZqJMgmyNm3MDr",
-	"2BsMfywmGV3M2CoDA112Rs7ZBkiMHfy9X11",
-	"kK1Q4gPyYfVVMzQtAPRzL8qXMqJ67Y7tKs",
-	"28J4mx8xfUtM92DbQ6i2Jmqw5J7dNivfroN",
-	"gQvgyG1djgtftoCVrSZmsRxr7okD4LheKw",
-	"3iFGBKapAWWzbiGFSr5ScbhrEPm6Esyvia",
-	"NFW2akQH2vu7AqkQXxFz2P5vkXTWkSqrSm",
-	"2MQJjLnWRp9eHh6MpCwpiUeshhtmri12mci",
-	"2QjRQUMyL6iodtHP9zKmxCNYZ7k3jxtk49C",
-	"USdfKy7B6oFNoauHWMmoCA7ND9rHqYw2Mf",
-	"cA49et9WtptYHf6wA1F8qqVgH3kS5jJ9vK",
-	"qaJT9TjcMi46sTKcgwRQU8o5Lw2Ea1gC4N",
-	"22pyn5RyhqtTQu4obYjuWYRNNw4i54L8xVr",
-	"22dkmukC6iH4FFLBmHne6modJZZQ3MC9BAT",
-	"z6CJZfYLvmd41GRVE8HASjRcy5hqbpHZvE",
-	"GEBWJ2KpRQDBTCCtvnaAJV2cYurgXS8pta",
-	"oS8fbEm82cprmAeineBeDkaKd7QownDZQh",
-	"rQpAs1LVQdphyj9ipEAuukAoj9kNpSP8cM",
-	"6NSJKsPxmqipGAfFFhUKbkopjrvEESTX3j",
-	"cuC68ycVXmD2EBzYFNYQ6akhKGrh3FGjSf",
-	"bw4wtYU8toepomrhWP2p8UFYfHBbvEV425",
-	"HvgNmDz5jD39Gwmi9VfDY1iYMhZUpZ8GKz",
-	"SbApuZAYquWP3Q6iD51BcMBQjuApYEkRVf",
-	"2Ugii5yxJgLzC59jV1vF8GK7UBZdvxwobeJ",
-	"21N2iJ1qnQRiJWcEqNRxXwfNp8QcmiyhtPy",
-	"9TC4RGs6AtFUsbcVWnSoCdoCpSfM66ALAc",
-	"oQzn55UWG4iMcY9bTNb27aTnRdfiGHAwbD",
-	"2GCdwsRpQhcf8SQcynFrMVDM26Bbj6sgv9M",
-	"2NRFe7REtSmaM2qAgZeG45hC8EtVGV2QjeB",
-	"25RGnhN7VojHUTvQBJA9nBT5y1qTQGULMzR",
-	"26uCBDfF8E2PJU2Dzz2ysgKwv9m4BhodTz9",
-	"Wkvima5cF7DDFdmJQqcdq8Syaq9DuAJJRD",
-	"286hSoJYxvENFSHwG51ZbmKaochLJyq4ERQ",
-	"FEGxF3HPoM2HCWHn82tyeh9o7vEQq5ySGE",
-	"h38DxNxGhWGTq9p5tJnN5r4Fwnn85Krrb6",
-	"2c1UU8J6Y3kL4cmQh21Tj8wkzidCiZxwdwd",
-	"2bJ32KuGmjmwKyAtzWdLFpXNM6t83CCPLq5",
-	"2fi8oLC9zfVVGnzzQtu3Y3rffS65Hiz6QHo",
-	"TKD93RxFr2Am44TntLiJQus4qcEwTtvEEQ",
-	"zMDywYdGEDtTSvWnCyc3qsYHWwj9ogws74",
-	"25NbotTka7TwtbXUpSCQD8RMgHKspyDubXJ",
-	"2ayCELBERubQWH5QxUr3cTxrYpidvUAzsSw",
-	"RMTCwLiYDKEAiJu5ekHL1NQ8UKHi5ozCPg",
-	"ejJjiCwp86ykmFr5iTJ8LxQXJ2wJPTYmkm",
-}
-
+// InitTransaction creates the initialize transaction
 func InitTransaction() coin.Transaction {
 	var tx coin.Transaction
 
 	output := cipher.MustSHA256FromHex("043836eb6f29aaeb8b9bfce847e07c159c72b25ae17d291f32125e7f1912e2a0")
 	tx.PushInput(output)
 
-	for i := 0; i < 100; i++ {
-		addr := cipher.MustDecodeBase58Address(AddrList[i])
-		tx.PushOutput(addr, 1e12, 1) // 10e6*10e6
+	addrs := visor.GetDistributionAddresses()
+
+	if len(addrs) != 100 {
+		log.Panic("Should have 100 distribution addresses")
+	}
+
+	// 1 million per address, measured in droplets
+	if visor.DistributionAddressInitialBalance != 1e6 {
+		log.Panic("visor.DistributionAddressInitialBalance expected to be 1e6*1e6")
+	}
+
+	for i := range addrs {
+		addr := cipher.MustDecodeBase58Address(addrs[i])
+		tx.PushOutput(addr, visor.DistributionAddressInitialBalance*1e6, 1)
 	}
 	/*
 		seckeys := make([]cipher.SecKey, 1)
@@ -709,4 +792,12 @@ func InitTransaction() coin.Transaction {
 
 	log.Printf("signature= %s", tx.Sigs[0].Hex())
 	return tx
+}
+
+func createDirIfNotExist(dir string) error {
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		return nil
+	}
+
+	return os.Mkdir(dir, 0777)
 }

@@ -1,9 +1,9 @@
 {
-  "name": "skycoin",
-  "productName": "Skycoin",
-  "version": "0.8.1",
   "main": "electron-main.js",
+  "license": "MIT",
+  "description": "skycoin wallet",
   "dependencies": {
-    "electron-debug": "^1.0.1"
+    "electron-debug": "^1.0.1",
+    "electron-log": "^1.2.2"
   }
 }

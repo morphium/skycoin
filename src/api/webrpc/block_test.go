@@ -2,8 +2,9 @@ package webrpc
 
 import (
 	"encoding/json"
-	"reflect"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 
 	"github.com/skycoin/skycoin/src/visor"
 )
@@ -60,6 +61,10 @@ var blockString = `{
         }
     ]
 }`
+
+var emptyBlockString = `{
+							"blocks":[]
+						}`
 
 func decodeBlock(str string) *visor.ReadableBlocks {
 	var blocks visor.ReadableBlocks
@@ -147,9 +152,10 @@ func Test_getLastBlocksHandler(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		if got := getLastBlocksHandler(tt.args.req, tt.args.gateway); !reflect.DeepEqual(got, tt.want) {
-			t.Errorf("%q. getLastBlocksHandler() = %v, want %v", tt.name, got, tt.want)
-		}
+		t.Run(tt.name, func(t *testing.T) {
+			got := getLastBlocksHandler(tt.args.req, tt.args.gateway)
+			require.Equal(t, tt.want, got)
+		})
 	}
 }
 
@@ -239,12 +245,91 @@ func Test_getBlocksHandler(t *testing.T) {
 				},
 				gateway: &fakeGateway{},
 			},
-			makeSuccessResponse("1", &visor.ReadableBlocks{}),
+			makeSuccessResponse("1", nil),
 		},
 	}
+
 	for _, tt := range tests {
-		if got := getBlocksHandler(tt.args.req, tt.args.gateway); !reflect.DeepEqual(got, tt.want) {
-			t.Errorf("%q. getBlocksHandler() = %v, want %v", tt.name, got, tt.want)
-		}
+		t.Run(tt.name, func(t *testing.T) {
+			got := getBlocksHandler(tt.args.req, tt.args.gateway)
+			require.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func Test_getBlocksBySeqHandler(t *testing.T) {
+	m := NewGatewayerMock()
+	m.On("GetBlocksInDepth", []uint64{454}).Return(decodeBlock(blockString), nil)
+	m.On("GetBlocksInDepth", []uint64{1000}).Return(decodeBlock(emptyBlockString), nil)
+
+	type args struct {
+		req     Request
+		gateway Gatewayer
+	}
+	tests := []struct {
+		name string
+		args args
+		want Response
+	}{
+		// TODO: Add test cases.
+		{
+			"normal",
+			args{
+				req: Request{
+					ID:      "1",
+					Jsonrpc: jsonRPC,
+					Method:  "get_blocks_by_seq",
+					Params:  []byte(`[454]`),
+				},
+				gateway: m,
+			},
+			makeSuccessResponse("1", decodeBlock(blockString)),
+		},
+		{
+			"none exist seq",
+			args{
+				req: Request{
+					ID:      "1",
+					Jsonrpc: jsonRPC,
+					Method:  "get_blocks_by_seq",
+					Params:  []byte(`[1000]`),
+				},
+				gateway: m,
+			},
+			makeSuccessResponse("1", decodeBlock(emptyBlockString)),
+		},
+		{
+			"invalid request param",
+			args{
+				req: Request{
+					ID:      "1",
+					Jsonrpc: jsonRPC,
+					Method:  "get_blocks_by_seq",
+					Params:  []byte(`["454"]`),
+				},
+				gateway: m,
+			},
+			makeErrorResponse(errCodeInvalidParams, errMsgInvalidParams),
+		},
+		{
+			"empty param",
+			args{
+				req: Request{
+					ID:      "1",
+					Jsonrpc: jsonRPC,
+					Method:  "get_blocks_by_seq",
+					Params:  []byte(`[]`),
+				},
+				gateway: m,
+			},
+			makeErrorResponse(errCodeInvalidParams, "empty params"),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := getBlocksBySeqHandler(tt.args.req, tt.args.gateway)
+			require.Equal(t, tt.want, got)
+		})
 	}
 }

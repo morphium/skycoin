@@ -1,9 +1,13 @@
+// +build ignore
 package visor
 
 import (
-	"crypto/rand"
+	"testing"
+	"time"
 
-	"github.com/skycoin/skycoin/src/cipher"
+	"github.com/skycoin/skycoin/src/coin"
+	"github.com/skycoin/skycoin/src/testutil"
+	"github.com/skycoin/skycoin/src/util/utc"
 )
 
 const (
@@ -102,31 +106,26 @@ const (
 // 	}
 // }
 
-func randSHA256() cipher.SHA256 {
-	b := make([]byte, 128)
-	rand.Read(b)
-	return cipher.SumSHA256(b)
+func createUnconfirmedTxn(t *testing.T) UnconfirmedTxn {
+	ut := UnconfirmedTxn{}
+	ut.Txn = coin.Transaction{}
+	ut.Txn.InnerHash = testutil.RandSHA256(t)
+	ut.Received = utc.Now().UnixNano()
+	ut.Checked = ut.Received
+	ut.Announced = time.Time{}.UnixNano()
+	return ut
 }
-
-// func createUnconfirmedTxn() UnconfirmedTxn {
-// 	ut := UnconfirmedTxn{}
-// 	ut.Txn = coin.Transaction{}
-// 	ut.Txn.Head.Hash = randSHA256()
-// 	ut.Received = util.Now()
-// 	ut.Checked = ut.Received
-// 	ut.Announced = util.ZeroTime()
-// 	return ut
-// }
 
 // func addUnconfirmedTxn(v *Visor) UnconfirmedTxn {
 // 	ut := createUnconfirmedTxn()
-// 	v.Unconfirmed.Txns[ut.Hash()] = ut
+// 	ut.Hash()
+// 	v.Unconfirmed.txns.put(&ut)
 // 	return ut
 // }
 
 // func addUnconfirmedTxnToPool(utp *UnconfirmedTxnPool) UnconfirmedTxn {
 // 	ut := createUnconfirmedTxn()
-// 	utp.Txns[ut.Hash()] = ut
+// 	utp.txns.put(&ut)
 // 	return ut
 // }
 
@@ -147,7 +146,7 @@ func randSHA256() cipher.SHA256 {
 // 		return err
 // 	}
 // 	mv.InjectTxn(tx)
-// 	now := uint64(util.UnixNow())
+// 	now := uint64(utc.UnixNow())
 // 	if len(mv.blockchain.Blocks) > 0 {
 // 		now = mv.blockchain.Time() + 1
 // 	}

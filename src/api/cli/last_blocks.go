@@ -5,21 +5,24 @@ import (
 
 	"strconv"
 
-	"github.com/skycoin/skycoin/src/api/webrpc"
 	gcli "github.com/urfave/cli"
 )
 
-func init() {
-	cmd := gcli.Command{
-		Name:      "lastBlocks",
-		Usage:     "Displays the content of the most recently N generated blocks",
-		ArgsUsage: "[numberOfBlocks]",
-		Action:    getLastBlocks,
+func lastBlocksCmd() gcli.Command {
+	name := "lastBlocks"
+	return gcli.Command{
+		Name:         name,
+		Usage:        "Displays the content of the most recently N generated blocks",
+		ArgsUsage:    "[numberOfBlocks]",
+		OnUsageError: onCommandUsageError(name),
+		Action:       getLastBlocks,
 	}
-	Commands = append(Commands, cmd)
+	// Commands = append(Commands, cmd)
 }
 
 func getLastBlocks(c *gcli.Context) error {
+	rpcClient := RpcClientFromContext(c)
+
 	num := c.Args().First()
 	if num == "" {
 		num = "1"
@@ -27,24 +30,14 @@ func getLastBlocks(c *gcli.Context) error {
 
 	n, err := strconv.ParseUint(num, 10, 64)
 	if err != nil {
-		return err
+		return fmt.Errorf("invalid block number, %s", err)
 	}
 
-	param := []uint64{n}
-	req, err := webrpc.NewRequest("get_lastblocks", param, "1")
-	if err != nil {
-		return fmt.Errorf("do rpc request failed: %v", err)
-	}
+	blocks, err := rpcClient.GetLastBlocks(n)
 
-	rsp, err := webrpc.Do(req, rpcAddress)
 	if err != nil {
 		return err
 	}
 
-	if rsp.Error != nil {
-		return fmt.Errorf("do rpc request failed: %+v", *rsp.Error)
-	}
-
-	fmt.Println(string(rsp.Result))
-	return nil
+	return printJson(blocks)
 }

@@ -2,13 +2,11 @@ package daemon
 
 import (
 	"github.com/skycoin/skycoin/src/cipher"
-	//"github.com/skycoin/skycoin/src/visor"
-	//"github.com/skycoin/skycoin/src/wallet"
 )
 
-// A connection's state within the daemon
+// Connection a connection's state within the daemon
 type Connection struct {
-	Id           int    `json:"id"`
+	ID           int    `json:"id"`
 	Addr         string `json:"address"`
 	LastSent     int64  `json:"last_sent"`
 	LastReceived int64  `json:"last_received"`
@@ -21,75 +19,154 @@ type Connection struct {
 	ListenPort uint16 `json:"listen_port"`
 }
 
-// An array of connections
+// Connections an array of connections
 // Arrays must be wrapped in structs to avoid certain javascript exploits
 type Connections struct {
 	Connections []*Connection `json:"connections"`
 }
 
+// BlockchainProgress current sync blockchain status
 type BlockchainProgress struct {
 	// Our current blockchain length
 	Current uint64 `json:"current"`
 	// Our best guess at true blockchain length
 	Highest uint64 `json:"highest"`
+	Peers   []struct {
+		Address string `json:"address"`
+		Height  uint64 `json:"height"`
+	} `json:"peers"`
 }
 
+// ResendResult rebroadcast tx result
 type ResendResult struct {
+	Txids []string `json:"txids"` // transaction id
 }
 
+// RPC rpc
 type RPC struct{}
 
-func (self RPC) GetConnection(d *Daemon, addr string) *Connection {
+// GetConnection gets connection of given address
+func (rpc RPC) GetConnection(d *Daemon, addr string) *Connection {
 	if d.Pool.Pool == nil {
 		return nil
 	}
-	c := d.Pool.Pool.Addresses[addr]
+
+	c, err := d.Pool.Pool.GetConnection(addr)
+	if err != nil {
+		logger.Error("%v", err)
+		return nil
+	}
+
 	if c == nil {
 		return nil
 	}
-	_, expecting := d.ExpectingIntroductions[addr]
+
+	mirror, exist := d.connectionMirrors.Get(addr)
+	if !exist {
+		return nil
+	}
+
 	return &Connection{
-		Id:           c.Id,
+		ID:           c.ID,
 		Addr:         addr,
 		LastSent:     c.LastSent.Unix(),
 		LastReceived: c.LastReceived.Unix(),
-		Outgoing:     (d.OutgoingConnections[addr] == nil),
-		Introduced:   !expecting,
-		Mirror:       d.ConnectionMirrors[addr],
+		Outgoing:     !d.outgoingConnections.Get(addr),
+		Introduced:   !d.needsIntro(addr),
+		Mirror:       mirror,
 		ListenPort:   d.GetListenPort(addr),
 	}
 }
 
-func (self RPC) GetConnections(d *Daemon) *Connections {
+// GetConnections gets all connections
+func (rpc RPC) GetConnections(d *Daemon) *Connections {
 	if d.Pool.Pool == nil {
 		return nil
 	}
-	conns := make([]*Connection, len(d.Pool.Pool.Pool))
-	for i, c := range d.Pool.Pool.GetConnections() {
-		conns[i] = self.GetConnection(d, c.Addr())
+
+	l, err := d.Pool.Pool.Size()
+	if err != nil {
+		logger.Error("%v", err)
+		return nil
+	}
+
+	conns := make([]*Connection, 0, l)
+	cs, err := d.Pool.Pool.GetConnections()
+	if err != nil {
+		logger.Error("%v", err)
+		return nil
+	}
+
+	for _, c := range cs {
+		if c.Solicited {
+			conn := rpc.GetConnection(d, c.Addr())
+			if conn != nil {
+				conns = append(conns, conn)
+			}
+		}
 	}
 	return &Connections{Connections: conns}
 }
 
-func (self RPC) GetDefaultConnections(d *Daemon) []string {
+// GetDefaultConnections gets default connections
+func (rpc RPC) GetDefaultConnections(d *Daemon) []string {
 	return d.DefaultConnections
 }
 
-func (self RPC) GetBlockchainProgress(v *Visor) *BlockchainProgress {
-	if v.Visor == nil {
-		return nil
-	}
-	return &BlockchainProgress{
-		Current: v.Visor.HeadBkSeq(),
-		Highest: v.EstimateBlockchainLength(),
-	}
+// GetTrustConnections get all trusted transaction
+func (rpc RPC) GetTrustConnections(d *Daemon) []string {
+	return d.Pex.Trusted().ToAddrs()
 }
 
-func (self RPC) ResendTransaction(v *Visor, p *Pool,
-	txHash cipher.SHA256) *ResendResult {
-	if v.Visor == nil {
+// GetAllExchgConnections return all exchangeable connections
+func (rpc RPC) GetAllExchgConnections(d *Daemon) []string {
+	return d.Pex.RandomExchangeable(0).ToAddrs()
+}
+
+// GetBlockchainProgress gets the blockchain progress
+func (rpc RPC) GetBlockchainProgress(v *Visor) *BlockchainProgress {
+	if v.v == nil {
+		return nil
+	}
+
+	bp := &BlockchainProgress{
+		Current: v.HeadBkSeq(),
+		Highest: v.EstimateBlockchainHeight(),
+	}
+
+	peerHeights := v.GetPeerBlockchainHeights()
+
+	for _, ph := range peerHeights {
+		bp.Peers = append(bp.Peers, struct {
+			Address string `json:"address"`
+			Height  uint64 `json:"height"`
+		}{
+			Address: ph.Address,
+			Height:  ph.Height,
+		})
+	}
+
+	return bp
+}
+
+// ResendTransaction rebroadcast transaction
+func (rpc RPC) ResendTransaction(v *Visor, p *Pool, txHash cipher.SHA256) *ResendResult {
+	if v.v == nil {
 		return nil
 	}
 	v.ResendTransaction(txHash, p)
 	return &ResendResult{}
+}
+
+// ResendUnconfirmedTxns rebroadcast unconfirmed transactions
+func (rpc RPC) ResendUnconfirmedTxns(v *Visor, p *Pool) *ResendResult {
+	if v.v == nil {
+		return nil
+	}
+	txids := v.ResendUnconfirmedTxns(p)
+	var rlt ResendResult
+	for _, txid := range txids {
+		rlt.Txids = append(rlt.Txids, txid.Hex())
+	}
+	return &rlt
 }

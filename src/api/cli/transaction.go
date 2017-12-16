@@ -1,20 +1,24 @@
 package cli
 
 import (
+	"encoding/hex"
 	"errors"
 	"fmt"
 
 	"github.com/skycoin/skycoin/src/cipher"
+	"github.com/skycoin/skycoin/src/coin"
+	"github.com/skycoin/skycoin/src/visor"
 
-	"github.com/skycoin/skycoin/src/api/webrpc"
 	gcli "github.com/urfave/cli"
 )
 
-func init() {
-	cmd := gcli.Command{
-		Name:      "transaction",
-		Usage:     "Show detail info of specific transaction",
-		ArgsUsage: "[transaction id]",
+func transactionCmd() gcli.Command {
+	name := "transaction"
+	return gcli.Command{
+		Name:         name,
+		Usage:        "Show detail info of specific transaction",
+		ArgsUsage:    "[transaction id]",
+		OnUsageError: onCommandUsageError(name),
 		Action: func(c *gcli.Context) error {
 			txid := c.Args().First()
 			if txid == "" {
@@ -24,26 +28,55 @@ func init() {
 			// validate the txid
 			_, err := cipher.SHA256FromHex(txid)
 			if err != nil {
-				return errors.New("error txid")
+				return errors.New("invalid txid")
 			}
 
-			req, err := webrpc.NewRequest("get_transaction", []string{txid}, "1")
+			rpcClient := RpcClientFromContext(c)
+
+			tx, err := rpcClient.GetTransactionByID(txid)
 			if err != nil {
-				return fmt.Errorf("create rpc request failed:%v", err)
+				return err
 			}
 
-			rsp, err := webrpc.Do(req, rpcAddress)
+			return printJson(tx)
+		},
+	}
+}
+
+func decodeRawTxCmd() gcli.Command {
+	name := "decodeRawTransaction"
+	return gcli.Command{
+		Name:         name,
+		Usage:        "Decode raw transaction",
+		ArgsUsage:    "[raw transaction]",
+		OnUsageError: onCommandUsageError(name),
+		Action: func(c *gcli.Context) error {
+			rawTxStr := c.Args().First()
+			if rawTxStr == "" {
+				errorWithHelp(c, errors.New("missing raw transaction value"))
+				return nil
+			}
+
+			b, err := hex.DecodeString(rawTxStr)
 			if err != nil {
-				return fmt.Errorf("do rpc request failed:%v", err)
+				fmt.Printf("invalid raw transaction: %v\n", err)
+				return err
 			}
 
-			if rsp.Error != nil {
-				return fmt.Errorf("do rpc request failed:%+v", rsp.Error)
+			tx, err := coin.TransactionDeserialize(b)
+			if err != nil {
+				fmt.Printf("Unable to deserialize transaction bytes: %v\n", err)
+				return err
 			}
 
-			fmt.Println(string(rsp.Result))
+			txStr, err := visor.TransactionToJSON(tx)
+			if err != nil {
+				fmt.Println(err)
+				return err
+			}
+
+			fmt.Println(txStr)
 			return nil
 		},
 	}
-	Commands = append(Commands, cmd)
 }

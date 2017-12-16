@@ -4,10 +4,9 @@ import (
 	"encoding/hex"
 	"math/rand"
 	"testing"
-	"time"
 
 	"github.com/skycoin/skycoin/src/cipher"
-	"github.com/stretchr/testify/assert"
+	"github.com/skycoin/skycoin/src/util/utc"
 )
 
 var (
@@ -20,13 +19,8 @@ var (
 	_genCoinHours        uint64 = 1000 * 1000
 )
 
-func assertError(t *testing.T, err error, msg string) {
-	assert.NotNil(t, err)
-	assert.Equal(t, err.Error(), msg)
-}
-
 func tNow() uint64 {
-	return uint64(time.Now().UTC().Unix())
+	return uint64(utc.UnixNow())
 }
 
 func _feeCalc(t *Transaction) (uint64, error) {
@@ -133,7 +127,7 @@ func _gaddr(s cipher.SecKey) cipher.Address {
 	return cipher.AddressFromSecKey(s)
 }
 
-func _gaddr_a1(S []cipher.SecKey) []cipher.Address {
+func _gaddrA1(S []cipher.SecKey) []cipher.Address {
 	A := make([]cipher.Address, len(S))
 	for i := 0; i < len(S); i++ {
 		A[i] = cipher.AddressFromSecKey(S[i])
@@ -141,8 +135,8 @@ func _gaddr_a1(S []cipher.SecKey) []cipher.Address {
 	return A
 }
 
-func _gaddr_a2(S []cipher.SecKey, O []UxOut) []int {
-	A := _gaddr_a1(S)
+func _gaddrA2(S []cipher.SecKey, O []UxOut) []int {
+	A := _gaddrA1(S)
 	var M map[cipher.Address]int //address to int
 	for i, a := range A {
 		M[a] = i
@@ -156,8 +150,8 @@ func _gaddr_a2(S []cipher.SecKey, O []UxOut) []int {
 	return I
 }
 
-func _gaddr_a3(S []cipher.SecKey, O []UxOut) map[cipher.Address]int {
-	A := _gaddr_a1(S)
+func _gaddrA3(S []cipher.SecKey, O []UxOut) map[cipher.Address]int {
+	A := _gaddrA1(S)
 	M := make(map[cipher.Address]int) //address to int
 	for i, a := range A {
 		M[a] = i
@@ -166,7 +160,7 @@ func _gaddr_a3(S []cipher.SecKey, O []UxOut) map[cipher.Address]int {
 }
 
 //assign amt to n bins in randomized manner
-func _rand_bins(amt uint64, n int) []uint64 {
+func _randBins(amt uint64, n int) []uint64 {
 	bins := make([]uint64, n)
 	max := amt / (4 * uint64(n))
 	for i := 0; amt > 0; i++ {

@@ -3,21 +3,13 @@ package gnet
 import (
 	"bytes"
 	"errors"
-	"io/ioutil"
 	"net"
 	"reflect"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
-	"gopkg.in/op/go-logging.v1"
 )
-
-func init() {
-	if silenceLogger {
-		logging.SetBackend(logging.NewLogBackend(ioutil.Discard, "", 0))
-	}
-}
 
 var (
 	_sendByteMessage = sendByteMessage
@@ -38,7 +30,7 @@ func TestConvertToMessage(t *testing.T) {
 	b := make([]byte, 0)
 	b = append(b, BytePrefix[:]...)
 	b = append(b, byte(7))
-	m, err := convertToMessage(c, b)
+	m, err := convertToMessage(c.ID, b, testing.Verbose())
 	assert.Nil(t, err)
 	assert.NotNil(t, m)
 	if m == nil {
@@ -53,7 +45,7 @@ func TestConvertToMessageNoMessageId(t *testing.T) {
 	resetHandler()
 	c := &Connection{}
 	b := []byte{}
-	m, err := convertToMessage(c, b)
+	m, err := convertToMessage(c.ID, b, testing.Verbose())
 	assert.Nil(t, m)
 	assert.NotNil(t, err)
 	assert.Equal(t, err.Error(), "Not enough data to read msg id")
@@ -64,7 +56,7 @@ func TestConvertToMessageUnknownMessage(t *testing.T) {
 	resetHandler()
 	c := &Connection{}
 	b := MessagePrefix{'C', 'C', 'C', 'C'}
-	m, err := convertToMessage(c, b[:])
+	m, err := convertToMessage(c.ID, b[:], testing.Verbose())
 	assert.NotNil(t, err)
 	assert.Equal(t, err.Error(), "Unknown message CCCC received")
 	assert.Nil(t, m)
@@ -79,14 +71,14 @@ func TestConvertToMessageBadDeserialize(t *testing.T) {
 	c := &Connection{}
 	// Test with too many bytes
 	b := append(DummyPrefix[:], []byte{0, 1, 1, 1}...)
-	m, err := convertToMessage(c, b)
+	m, err := convertToMessage(c.ID, b, testing.Verbose())
 	assert.NotNil(t, err)
 	assert.Equal(t, err.Error(), "Data buffer was not completely decoded")
 	assert.Nil(t, m)
 
 	// Test with not enough bytes
 	b = append([]byte{}, BytePrefix[:]...)
-	m, err = convertToMessage(c, b)
+	m, err = convertToMessage(c.ID, b, testing.Verbose())
 	assert.NotNil(t, err)
 	assert.Equal(t, err.Error(), "Deserialization failed")
 	assert.Nil(t, m)
@@ -98,7 +90,9 @@ func TestConvertToMessageNotMessage(t *testing.T) {
 	RegisterMessage(NothingPrefix, Nothing{})
 	// don't verify messages
 	c := &Connection{}
-	assert.Panics(t, func() { convertToMessage(c, NothingPrefix[:]) })
+	assert.Panics(t, func() {
+		convertToMessage(c.ID, NothingPrefix[:], testing.Verbose())
+	})
 }
 
 func TestDeserializeMessageTrapsPanic(t *testing.T) {
@@ -202,13 +196,13 @@ func NewCaptureConn() net.Conn {
 	return &CaptureConn{Wrote: nil, WriteDeadlineSet: false}
 }
 
-func (self *CaptureConn) Write(b []byte) (int, error) {
-	self.Wrote = b
+func (cc *CaptureConn) Write(b []byte) (int, error) {
+	cc.Wrote = b
 	return len(b), nil
 }
 
-func (self *CaptureConn) SetWriteDeadline(t time.Time) error {
-	self.WriteDeadlineSet = true
+func (cc *CaptureConn) SetWriteDeadline(t time.Time) error {
+	cc.WriteDeadlineSet = true
 	return nil
 }
 
@@ -216,7 +210,7 @@ type FailingWriteDeadlineConn struct {
 	net.Conn
 }
 
-func (self *FailingWriteDeadlineConn) SetWriteDeadline(t time.Time) error {
+func (c *FailingWriteDeadlineConn) SetWriteDeadline(t time.Time) error {
 	return errors.New("failed")
 }
 
@@ -224,10 +218,10 @@ type FailingWriteConn struct {
 	net.Conn
 }
 
-func (self *FailingWriteConn) Write(b []byte) (int, error) {
+func (c *FailingWriteConn) Write(b []byte) (int, error) {
 	return 0, errors.New("failed")
 }
 
-func (self *FailingWriteConn) SetWriteDeadline(t time.Time) error {
+func (c *FailingWriteConn) SetWriteDeadline(t time.Time) error {
 	return nil
 }

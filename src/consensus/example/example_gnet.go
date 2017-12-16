@@ -1,3 +1,5 @@
+// +build ignore
+
 // 20160901 - Initial version by user johnstuartmill,
 // public key 02fb4acf944c84d48341e3c1cb14d707034a68b7f931d6be6d732bec03597d6ff6
 // 20161025 - Code revision by user johnstuartmill.
@@ -14,12 +16,13 @@ package main
 import (
 	"flag"
 	"fmt"
-	gnet "github.com/skycoin/skycoin/src/aether"
 	"log"
 	mathrand "math/rand"
 	"os"
 	"sort"
 	"time"
+
+	"github.com/skycoin/skycoin/src/daemon/gnet"
 	//
 	"github.com/skycoin/skycoin/src/cipher"
 	"github.com/skycoin/skycoin/src/consensus"
@@ -624,7 +627,7 @@ func Simulate_compare_node_StateQueue(
 	for i, zzz_i := range zzz {
 		join_count := 0       // How many have selected the most popular hash.
 		other_count := 0      // How many have selected NOT the most popular.
-		prescribed_count := 0 // How many have selected the intented hash.
+		prescribed_count := 0 // How many have selected the intended hash.
 		malicious_count := 0  // How many have selected the malicious hash.
 
 		for seqno, hash2count := range zzz_i {
@@ -662,7 +665,7 @@ type MinimalConnectionManager struct {
 
 	// MinimalConnectionManager solicit a conn to them; receive data
 	// from them but do not send anything
-	publishers  PoolOwner
+	publishers PoolOwner
 
 	// MinimalConnectionManager accept
 	// connections. MinimalConnectionManager send data to them; does
@@ -980,7 +983,7 @@ func main() {
 					}
 
 					for j := 0; j < rep; j++ {
-						// Signing same hash multipe times produces different
+						// Signing same hash multiple times produces different
 						// signatures (for a good reason). We do it
 						// here to test if malicious re-publishing is
 						// detected properly.

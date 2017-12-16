@@ -2,37 +2,41 @@ package cli
 
 import (
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 
-	bip39 "github.com/skycoin/skycoin/src/api/cli/go-bip39"
 	"github.com/skycoin/skycoin/src/cipher"
+	"github.com/skycoin/skycoin/src/cipher/go-bip39"
 	secp256k1 "github.com/skycoin/skycoin/src/cipher/secp256k1-go"
 	"github.com/skycoin/skycoin/src/wallet"
 
 	gcli "github.com/urfave/cli"
 )
 
-func init() {
-	cmd := gcli.Command{
-		Name:      "generateWallet",
-		Usage:     "Generate a new wallet",
-		ArgsUsage: " ",
-		Description: `Use caution when using the "-p" command. If you have command 
-		history enabled your wallet encryption password can be recovered 
-		from the history log. If you do not include the "-p" option you will 
-		be prompted to enter your password after you enter your command. 
-		
-		All results are returned in JSON format.`,
+const (
+	alphaNumericSeedLength = 64 // bytes
+)
+
+func generateWalletCmd(cfg Config) gcli.Command {
+	name := "generateWallet"
+	return gcli.Command{
+		Name:         "generateWallet",
+		Usage:        "Generate a new wallet",
+		ArgsUsage:    " ",
+		OnUsageError: onCommandUsageError(name),
+		Description: fmt.Sprintf(`The default wallet (%s) will
+		be created if no wallet and address was specified.
+
+		Use caution when using the "-p" command. If you have command
+		history enabled your wallet encryption password can be recovered
+		from the history log. If you do not include the "-p" option you will
+		be prompted to enter your password after you enter your command.
+
+		All results are returned in JSON format.`, cfg.FullWalletPath()),
 		Flags: []gcli.Flag{
-			gcli.StringFlag{
-				Name:  "s",
-				Usage: "Your seed",
-			},
 			gcli.BoolFlag{
 				Name:  "r",
 				Usage: "A random alpha numeric seed will be generated for you",
@@ -41,16 +45,20 @@ func init() {
 				Name:  "rd",
 				Usage: "A random seed consisting of 12 dictionary words will be generated for you",
 			},
-			gcli.IntFlag{
+			gcli.StringFlag{
+				Name:  "s",
+				Usage: "Your seed",
+			},
+			gcli.UintFlag{
 				Name:  "n",
 				Value: 1,
-				Usage: `[numberOfAddresses] Number of addresses to generate 
+				Usage: `[numberOfAddresses] Number of addresses to generate
 						By default 1 address is generated.`,
 			},
 			gcli.StringFlag{
 				Name:  "f",
-				Value: defaultWalletName,
-				Usage: `[walletName] Name of wallet. The final format will be "yourName.wlt". 
+				Value: cfg.WalletName,
+				Usage: `[walletName] Name of wallet. The final format will be "yourName.wlt".
 						 If no wallet name is specified a generic name will be selected.`,
 			},
 			gcli.StringFlag{
@@ -60,13 +68,15 @@ func init() {
 		},
 		Action: generateWallet,
 	}
-	Commands = append(Commands, cmd)
+	// Commands = append(Commands, cmd)
 }
 
 func generateWallet(c *gcli.Context) error {
+	cfg := ConfigFromContext(c)
+
 	// create wallet dir if not exist
-	if _, err := os.Stat(walletDir); os.IsNotExist(err) {
-		if err := os.MkdirAll(walletDir, 0755); err != nil {
+	if _, err := os.Stat(cfg.WalletDir); os.IsNotExist(err) {
+		if err := os.MkdirAll(cfg.WalletDir, 0755); err != nil {
 			return errors.New("create dir failed")
 		}
 	}
@@ -76,7 +86,7 @@ func generateWallet(c *gcli.Context) error {
 
 	// check if the wallet name has wlt extension.
 	if !strings.HasSuffix(wltName, ".wlt") {
-		return errWalletName
+		return ErrWalletName
 	}
 
 	// wallet file should not be a path.
@@ -85,14 +95,20 @@ func generateWallet(c *gcli.Context) error {
 	}
 
 	// check if the wallet file does exist
-	if _, err := os.Stat(filepath.Join(walletDir, wltName)); err == nil {
-		return fmt.Errorf("%v already exist", wltName)
+	if _, err := os.Stat(filepath.Join(cfg.WalletDir, wltName)); err == nil {
+		errorWithHelp(c, fmt.Errorf("%v already exist", wltName))
+		return nil
+	}
+
+	// check if the wallet dir does exist.
+	if _, err := os.Stat(cfg.WalletDir); os.IsNotExist(err) {
+		return err
 	}
 
 	// get number of address that are need to be generated, if m is 0, set to 1.
-	num := c.Int("n")
+	num := c.Uint64("n")
 	if num == 0 {
-		num = 1
+		return errors.New("-n must > 0")
 	}
 
 	// get label
@@ -107,25 +123,17 @@ func generateWallet(c *gcli.Context) error {
 	if err != nil {
 		return err
 	}
-	wlt := wallet.NewWallet(sd, wltName, label)
-	wlt.GenerateAddresses(num)
 
-	// check if the wallet dir does exist.
-	if _, err := os.Stat(walletDir); os.IsNotExist(err) {
-		return err
-	}
-
-	if err := wlt.Save(walletDir); err != nil {
-		return err
-	}
-
-	rwlt := wallet.NewReadableWallet(wlt)
-	d, err := json.MarshalIndent(rwlt, "", "    ")
+	wlt, err := GenerateWallet(wltName, label, sd, num)
 	if err != nil {
-		return errJSONMarshal
+		return err
 	}
-	fmt.Println(string(d))
-	return nil
+
+	if err := wlt.Save(cfg.WalletDir); err != nil {
+		return err
+	}
+
+	return printJson(wallet.NewReadableWallet(*wlt))
 }
 
 func makeSeed(s string, r, rd bool) (string, error) {
@@ -145,13 +153,34 @@ func makeSeed(s string, r, rd bool) (string, error) {
 
 	// 010
 	if r {
-		seedRaw := cipher.SumSHA256(secp256k1.RandByte(64))
-		return hex.EncodeToString(seedRaw[:]), nil
+		return MakeAlphanumericSeed(), nil
 	}
 
 	// 001, 000
-	// https://github.com/tyler-smith/go-bip39 generate mnemonic.
-	entropy, _ := bip39.NewEntropy(128)
-	mnemonic, _ := bip39.NewMnemonic(entropy)
-	return mnemonic, nil
+	return bip39.NewDefaultMnemomic()
+}
+
+// PUBLIC
+
+// GenerateWallet generates a new wallet with filename walletFile, label, seed and number of addresses.
+// Caller should save the wallet file to its chosen directory
+func GenerateWallet(walletFile, label, seed string, numAddrs uint64) (*wallet.Wallet, error) {
+	walletFile = filepath.Base(walletFile)
+
+	wlt, err := wallet.NewWallet(walletFile, wallet.Options{
+		Seed:  seed,
+		Label: label,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	wlt.GenerateAddresses(numAddrs)
+
+	return wlt, nil
+}
+
+func MakeAlphanumericSeed() string {
+	seedRaw := cipher.SumSHA256(secp256k1.RandByte(alphaNumericSeedLength))
+	return hex.EncodeToString(seedRaw[:])
 }

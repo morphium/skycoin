@@ -1,16 +1,16 @@
 package cli
 
 import (
-	"encoding/json"
 	"fmt"
 	"reflect"
 
 	gcli "github.com/urfave/cli"
 )
 
-func init() {
-	cmd := gcli.Command{
-		Name:      "version",
+func versionCmd() gcli.Command {
+	name := "version"
+	return gcli.Command{
+		Name:      name,
 		ArgsUsage: "List the current version of Skycoin components",
 		Usage:     " ",
 		Flags: []gcli.Flag{
@@ -19,6 +19,7 @@ func init() {
 				Usage: "Returns the results in JSON format",
 			},
 		},
+		OnUsageError: onCommandUsageError(name),
 		Action: func(c *gcli.Context) error {
 			var ver = struct {
 				Skycoin string `json:"skycoin"`
@@ -26,20 +27,15 @@ func init() {
 				RPC     string `json:"rpc"`
 				Wallet  string `json:"wallet"`
 			}{
-				"0.1",
-				"0.1",
-				"0.1",
-				"0.1",
+				Version,
+				Version,
+				Version,
+				Version,
 			}
 
 			jsonFmt := c.Bool("json")
 			if jsonFmt {
-				d, err := json.MarshalIndent(ver, "", "    ")
-				if err != nil {
-					return errJSONMarshal
-				}
-				fmt.Println(string(d))
-				return nil
+				return printJson(ver)
 			}
 
 			v := reflect.ValueOf(ver)
@@ -51,5 +47,5 @@ func init() {
 			return nil
 		},
 	}
-	Commands = append(Commands, cmd)
+	// Commands = append(Commands, cmd)
 }

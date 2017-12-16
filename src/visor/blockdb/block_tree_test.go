@@ -4,9 +4,11 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
+
 	"github.com/skycoin/skycoin/src/cipher"
 	"github.com/skycoin/skycoin/src/coin"
-	"github.com/stretchr/testify/assert"
+	"github.com/skycoin/skycoin/src/testutil"
 )
 
 type blockInfo struct {
@@ -23,14 +25,11 @@ type blockCase struct {
 }
 
 func testCase(t *testing.T, cases []blockCase) {
-	_, teardown, err := setup(t)
-	if err != nil {
-		t.Fatal(err)
-	}
+	db, close := testutil.PrepareDB(t)
+	defer close()
 
-	defer teardown()
-
-	btree := NewBlockTree()
+	btree, err := newBlockTree(db)
+	assert.Nil(t, err)
 	blocks := make([]coin.Block, len(cases))
 	for i, d := range cases {
 		var preHash cipher.SHA256
@@ -50,7 +49,7 @@ func testCase(t *testing.T, cases []blockCase) {
 
 		switch d.Action {
 		case "add":
-			err := btree.AddBlock(b)
+			err := btree.AddBlock(&b)
 			if err != d.Err {
 				t.Fatal(fmt.Sprintf("expect err:%v, but get err:%v", d.Err, err))
 			}
@@ -60,7 +59,7 @@ func testCase(t *testing.T, cases []blockCase) {
 				assert.Equal(t, *b1, b)
 			}
 		case "remove":
-			err := btree.RemoveBlock(b)
+			err := btree.RemoveBlock(&b)
 			if err != d.Err {
 				t.Fatal(fmt.Sprintf("expect err:%v, but get err:%v", d.Err, err))
 			}
@@ -70,7 +69,6 @@ func testCase(t *testing.T, cases []blockCase) {
 			}
 		}
 	}
-
 }
 
 func TestAddBlock(t *testing.T) {
@@ -161,13 +159,11 @@ func TestRemoveBlock(t *testing.T) {
 }
 
 func TestGetBlockInDepth(t *testing.T) {
-	_, teardown, err := setup(t)
-	if err != nil {
-		t.Fatal(err)
-	}
+	db, teardown := testutil.PrepareDB(t)
 	defer teardown()
 
-	bc := NewBlockTree()
+	bc, err := newBlockTree(db)
+	assert.Nil(t, err)
 	blocks := []coin.Block{
 		coin.Block{
 			Head: coin.BlockHeader{
@@ -190,11 +186,11 @@ func TestGetBlockInDepth(t *testing.T) {
 		},
 	}
 
-	assert.Nil(t, bc.AddBlock(blocks[0]))
+	assert.Nil(t, bc.AddBlock(&blocks[0]))
 	blocks[1].Head.PrevHash = blocks[0].HashHeader()
-	assert.Nil(t, bc.AddBlock(blocks[1]))
+	assert.Nil(t, bc.AddBlock(&blocks[1]))
 	blocks[2].Head.PrevHash = blocks[0].HashHeader()
-	assert.Nil(t, bc.AddBlock(blocks[2]))
+	assert.Nil(t, bc.AddBlock(&blocks[2]))
 
 	block := bc.GetBlockInDepth(1, func(hps []coin.HashPair) cipher.SHA256 {
 		for _, hp := range hps {

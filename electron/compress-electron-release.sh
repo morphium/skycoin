@@ -4,7 +4,11 @@ set -e -o pipefail
 # Compresses packaged electron apps after
 # ./package-electron-release.sh is done
 
-. build-conf.sh
+if [ -n "$1" ]; then
+    GOX_OSARCH="$1"
+fi
+
+. build-conf.sh "$GOX_OSARCH"
 
 SCRIPTDIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
@@ -33,7 +37,7 @@ if [ -e "$OSX64_ELN_PLT" ]; then
     popd >/dev/null
 fi
 
-# Windows
+# Windows 64bit
 if [ -e "$WIN64_ELN_PLT" ]; then
     if [ -e "$WIN64_ELN_ZIP" ]; then
         echo "Removing old $WIN64_ELN_ZIP"
@@ -46,6 +50,19 @@ if [ -e "$WIN64_ELN_PLT" ]; then
     FINALS+=("$WIN64_ELN_ZIP")
 fi
 
+# Windows 32bit
+if [ -e "$WIN32_ELN_PLT" ]; then
+    if [ -e "$WIN32_ELN_ZIP" ]; then
+        echo "Removing old $WIN32_ELN_ZIP"
+        rm "$WIN32_ELN_ZIP"
+    fi
+    echo "Zipping $WIN32_ELN_ZIP"
+    mv "$WIN32_ELN_PLT" "$WIN32_ELN"
+    zip -r --quiet "$WIN32_ELN_ZIP" "$WIN32_ELN"
+    mv "$WIN32_ELN" "$WIN32_ELN_PLT"
+    FINALS+=("$WIN32_ELN_ZIP")
+fi
+
 # Linux
 if [ -e "$LNX64_ELN_PLT" ]; then
     if [ -e "$LNX64_ELN_ZIP" ]; then
@@ -54,7 +71,11 @@ if [ -e "$LNX64_ELN_PLT" ]; then
     fi
     echo "Zipping $LNX64_ELN_ZIP"
     mv "$LNX64_ELN_PLT" "$LNX64_ELN"
-    tar czf "$LNX64_ELN_ZIP" --owner=0 --group=0 "$LNX64_ELN"
+    if [[ "$OSTYPE" == "linux"* ]]; then
+        tar czf "$LNX64_ELN_ZIP" --owner=0 --group=0 "$LNX64_ELN"
+    elif [[ "$OSTYPE" == "darwin"* ]]; then
+        tar czf "$LNX64_ELN_ZIP"  "$LNX64_ELN"
+    fi
     mv "$LNX64_ELN" "$LNX64_ELN_PLT"
     FINALS+=("$LNX64_ELN_ZIP")
 fi
